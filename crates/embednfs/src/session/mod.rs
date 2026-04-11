@@ -1,7 +1,7 @@
 //! NFSv4.1 session, object, and server-side state management.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, AtomicU64};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
@@ -95,9 +95,32 @@ impl StateManager {
         let mut write_verifier = [0u8; 8];
         write_verifier.copy_from_slice(&verifier_value.to_be_bytes());
 
+        // Generate a unique server_owner per StateManager instance so the
+        // Linux NFSv4.1 client does not treat two independent embednfs
+        // servers (e.g., running on different loopback ports in the same
+        // test process) as trunking-compatible siblings of one another.
+        //
+        // RFC 5661 §2.10.5: clients identify servers by the
+        // `server_owner.major_id` plus `server_scope`. If both fields
+        // match between two EXCHANGE_ID replies, the client assumes the
+        // responses come from the same server (or trunking peers of it)
+        // and may reuse the existing session/nfs_client for subsequent
+        // operations — silently routing traffic for one mount onto the
+        // transport already established for another.
+        //
+        // `clients.rs` continues to return a hardcoded server_scope of
+        // `"embednfs"`, but we make `major_id` carry a monotonically
+        // increasing counter so every server instance in the process gets
+        // a distinct identity. The atomic is process-global; wraparound
+        // is not a concern for any realistic deployment.
+        static NEXT_SERVER_OWNER_ID: AtomicU64 = AtomicU64::new(1);
+        let instance_id = NEXT_SERVER_OWNER_ID.fetch_add(1, Ordering::Relaxed);
+        let mut major_id = Vec::with_capacity(24);
+        major_id.extend_from_slice(b"embednfs-");
+        major_id.extend_from_slice(instance_id.to_string().as_bytes());
         let server_owner = ServerOwner4 {
             minor_id: 0,
-            major_id: Bytes::from_static(b"embednfs"),
+            major_id: Bytes::from(major_id),
         };
 
         Self {
