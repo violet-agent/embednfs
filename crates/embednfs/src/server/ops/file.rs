@@ -4,7 +4,9 @@ use tracing::warn;
 use embednfs_proto::*;
 
 use crate::attrs;
-use crate::fs::{FileSystem, FsError, ObjectType, RequestContext, WriteResult, WriteStability};
+use crate::fs::{
+    FileSystem, FsError, ObjectType, OpenRequest, RequestContext, WriteResult, WriteStability,
+};
 use crate::internal::{ServerFileType, ServerObject};
 use crate::session::{CurrentStateidMode, ResolvedStateid};
 
@@ -411,6 +413,25 @@ impl<F: FileSystem> NfsServer<F> {
 
         if !created && let Err(e) = &before_attr {
             return NfsResop4::Open(e.to_nfsstat4(), None);
+        }
+
+        if let ServerObject::Fs(id) = &object
+            && let Some(open_support) = self.fs.open_support()
+        {
+            let share_access = self.state.share_access_mode(args.share_access);
+            let request = OpenRequest {
+                read: (share_access & OPEN4_SHARE_ACCESS_READ) != 0,
+                write: (share_access & OPEN4_SHARE_ACCESS_WRITE) != 0,
+            };
+            if request.write {
+                let handle = match self.resolve_backend_handle(*id).await {
+                    Ok(handle) => handle,
+                    Err(e) => return NfsResop4::Open(e.to_nfsstat4(), None),
+                };
+                if let Err(e) = open_support.open(request_ctx, &handle, request).await {
+                    return NfsResop4::Open(e.to_nfsstat4(), None);
+                }
+            }
         }
 
         let stateid = match self
