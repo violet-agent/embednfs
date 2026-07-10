@@ -4,7 +4,9 @@ use tracing::warn;
 use embednfs_proto::*;
 
 use crate::attrs;
-use crate::fs::{FileSystem, FsError, ObjectType, RequestContext, WriteResult, WriteStability};
+use crate::fs::{
+    FileSystem, FsError, ObjectType, OpenRequest, RequestContext, WriteResult, WriteStability,
+};
 use crate::internal::{ServerFileType, ServerObject};
 use crate::session::{CurrentStateidMode, ResolvedStateid};
 
@@ -126,6 +128,7 @@ impl<F: FileSystem> NfsServer<F> {
 
     pub(crate) async fn op_close(
         &self,
+        request_ctx: &RequestContext,
         args: &CloseArgs4,
         current_fh: &Option<NfsFh4>,
         current_stateid: Option<Stateid4>,
@@ -165,8 +168,29 @@ impl<F: FileSystem> NfsServer<F> {
             Err(status) => return NfsResop4::Close(status, Stateid4::default()),
         }
 
+        let close_error = if let ServerObject::Fs(id) = object
+            && let Some(closer) = self.closer()
+        {
+            let handle = match self.resolve_backend_handle(id).await {
+                Ok(handle) => handle,
+                Err(e) => {
+                    return NfsResop4::Close(e.to_nfsstat4(), Stateid4::default());
+                }
+            };
+            closer
+                .close(request_ctx, &handle)
+                .await
+                .err()
+                .map(|e| e.to_nfsstat4())
+        } else {
+            None
+        };
+
         match self.state.close_state(&stateid).await {
-            Ok(stateid) => NfsResop4::Close(NfsStat4::Ok, stateid),
+            Ok(stateid) => match close_error {
+                Some(status) => NfsResop4::Close(status, Stateid4::default()),
+                None => NfsResop4::Close(NfsStat4::Ok, stateid),
+            },
             Err(status) => NfsResop4::Close(status, Stateid4::default()),
         }
     }
@@ -389,6 +413,25 @@ impl<F: FileSystem> NfsServer<F> {
 
         if !created && let Err(e) = &before_attr {
             return NfsResop4::Open(e.to_nfsstat4(), None);
+        }
+
+        if let ServerObject::Fs(id) = &object
+            && let Some(open_support) = self.fs.open_support()
+        {
+            let share_access = self.state.share_access_mode(args.share_access);
+            let request = OpenRequest {
+                read: (share_access & OPEN4_SHARE_ACCESS_READ) != 0,
+                write: (share_access & OPEN4_SHARE_ACCESS_WRITE) != 0,
+            };
+            if request.write {
+                let handle = match self.resolve_backend_handle(*id).await {
+                    Ok(handle) => handle,
+                    Err(e) => return NfsResop4::Open(e.to_nfsstat4(), None),
+                };
+                if let Err(e) = open_support.open(request_ctx, &handle, request).await {
+                    return NfsResop4::Open(e.to_nfsstat4(), None);
+                }
+            }
         }
 
         let stateid = match self

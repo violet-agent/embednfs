@@ -1,7 +1,5 @@
 use bytes::{Bytes, BytesMut};
-use embednfs::{
-    CreateKind, CreateRequest, FileSystem, MemFs, RequestContext, SetAttrs, WriteStability,
-};
+use embednfs::{CreateKind, CreateRequest, FileSystem, MemFs, RequestContext, WriteStability};
 use embednfs_proto::xdr::*;
 use embednfs_proto::*;
 use std::sync::atomic::AtomicUsize;

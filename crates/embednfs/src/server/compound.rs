@@ -184,6 +184,7 @@ impl<F: FileSystem> NfsServer<F> {
             NfsArgop4::Access(args) => self.op_access(request_ctx, args, &state.current_fh).await,
             NfsArgop4::Close(args) => {
                 self.op_close(
+                    request_ctx,
                     args,
                     &state.current_fh,
                     state.current_stateid,

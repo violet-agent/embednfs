@@ -1,4 +1,12 @@
 use super::*;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+use async_trait::async_trait;
+use embednfs::{
+    AccessMask, Attrs, CreateResult, DirPage, FsError, FsResult, FsStats, OpenRequest, OpenSupport,
+    ReadResult, SetAttrs, WriteResult, Xattrs,
+};
 
 // ===== OPEN + CLOSE (pynfs OPEN, CLOSE) =====
 
@@ -64,6 +72,197 @@ async fn test_open_nocreate_existing_file() {
     let (opnum, op_status) = parse_op_header(&mut resp);
     assert_eq!(opnum, OP_OPEN);
     assert_eq!(op_status, NfsStat4::Ok as u32);
+}
+
+struct WriteOpenDenyFs {
+    inner: MemFs,
+    opened: Arc<AtomicUsize>,
+}
+
+impl WriteOpenDenyFs {
+    async fn with_file(name: &str) -> Self {
+        Self {
+            inner: populated_fs(&[name]).await,
+            opened: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+}
+
+#[async_trait]
+impl OpenSupport<u64> for WriteOpenDenyFs {
+    async fn open(
+        &self,
+        _ctx: &RequestContext,
+        _handle: &u64,
+        request: OpenRequest,
+    ) -> FsResult<()> {
+        if request.write {
+            let _ = self.opened.fetch_add(1, Ordering::SeqCst);
+            return Err(FsError::AccessDenied);
+        }
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl FileSystem for WriteOpenDenyFs {
+    type Handle = u64;
+
+    fn root(&self) -> Self::Handle {
+        self.inner.root()
+    }
+
+    async fn statfs(&self, ctx: &RequestContext) -> FsResult<FsStats> {
+        self.inner.statfs(ctx).await
+    }
+
+    async fn getattr(&self, ctx: &RequestContext, handle: &Self::Handle) -> FsResult<Attrs> {
+        self.inner.getattr(ctx, handle).await
+    }
+
+    async fn access(
+        &self,
+        ctx: &RequestContext,
+        handle: &Self::Handle,
+        requested: AccessMask,
+    ) -> FsResult<AccessMask> {
+        self.inner.access(ctx, handle, requested).await
+    }
+
+    async fn lookup(
+        &self,
+        ctx: &RequestContext,
+        parent: &Self::Handle,
+        name: &str,
+    ) -> FsResult<Self::Handle> {
+        self.inner.lookup(ctx, parent, name).await
+    }
+
+    async fn parent(
+        &self,
+        ctx: &RequestContext,
+        dir: &Self::Handle,
+    ) -> FsResult<Option<Self::Handle>> {
+        self.inner.parent(ctx, dir).await
+    }
+
+    async fn readdir(
+        &self,
+        ctx: &RequestContext,
+        dir: &Self::Handle,
+        cookie: u64,
+        max_entries: u32,
+        with_attrs: bool,
+    ) -> FsResult<DirPage<Self::Handle>> {
+        self.inner
+            .readdir(ctx, dir, cookie, max_entries, with_attrs)
+            .await
+    }
+
+    async fn read(
+        &self,
+        ctx: &RequestContext,
+        handle: &Self::Handle,
+        offset: u64,
+        count: u32,
+    ) -> FsResult<ReadResult> {
+        self.inner.read(ctx, handle, offset, count).await
+    }
+
+    async fn write(
+        &self,
+        ctx: &RequestContext,
+        handle: &Self::Handle,
+        offset: u64,
+        data: Bytes,
+        requested: WriteStability,
+    ) -> FsResult<WriteResult> {
+        self.inner.write(ctx, handle, offset, data, requested).await
+    }
+
+    async fn create(
+        &self,
+        ctx: &RequestContext,
+        parent: &Self::Handle,
+        name: &str,
+        req: CreateRequest,
+    ) -> FsResult<CreateResult<Self::Handle>> {
+        self.inner.create(ctx, parent, name, req).await
+    }
+
+    async fn remove(
+        &self,
+        ctx: &RequestContext,
+        parent: &Self::Handle,
+        name: &str,
+    ) -> FsResult<()> {
+        self.inner.remove(ctx, parent, name).await
+    }
+
+    async fn rename(
+        &self,
+        ctx: &RequestContext,
+        from_dir: &Self::Handle,
+        from_name: &str,
+        to_dir: &Self::Handle,
+        to_name: &str,
+    ) -> FsResult<()> {
+        self.inner
+            .rename(ctx, from_dir, from_name, to_dir, to_name)
+            .await
+    }
+
+    async fn setattr(
+        &self,
+        ctx: &RequestContext,
+        handle: &Self::Handle,
+        attrs: &SetAttrs,
+    ) -> FsResult<Attrs> {
+        self.inner.setattr(ctx, handle, attrs).await
+    }
+
+    fn xattrs(&self) -> Option<&dyn Xattrs<Self::Handle>> {
+        self.inner.xattrs()
+    }
+
+    fn open_support(&self) -> Option<&dyn OpenSupport<Self::Handle>> {
+        Some(self)
+    }
+}
+
+/// OPEN with write share access runs optional OpenSupport before a stateid is
+/// granted and returns the hook's NFS error.
+/// Origin: Bloom open-time approval gate regression.
+/// RFC: RFC 8881 §18.16.3.
+#[tokio::test]
+async fn test_open_write_support_can_deny_before_stateid() {
+    let fs = WriteOpenDenyFs::with_file("guarded.txt").await;
+    let opened = Arc::clone(&fs.opened);
+    let port = start_server_with_fs(fs).await;
+    let mut stream = connect(port).await;
+    let sessionid = setup_session(&mut stream).await;
+
+    let seq_op = encode_sequence(&sessionid, 1, 0);
+    let rootfh_op = encode_putrootfh();
+    let open_op = encode_open_nocreate_with_access(
+        "guarded.txt",
+        OPEN4_SHARE_ACCESS_WRITE,
+        OPEN4_SHARE_DENY_NONE,
+    );
+    let compound = encode_compound("open-write-denied", &[&seq_op, &rootfh_op, &open_op]);
+    let mut resp = send_rpc(&mut stream, 3, 1, &compound).await;
+    parse_rpc_reply(&mut resp);
+
+    let (status, _, num_results) = parse_compound_header(&mut resp);
+    assert_eq!(status, NfsStat4::Access as u32);
+    assert_eq!(num_results, 3);
+    let _ = parse_op_header(&mut resp);
+    skip_sequence_res(&mut resp);
+    let _ = parse_op_header(&mut resp);
+    let (opnum, op_status) = parse_op_header(&mut resp);
+    assert_eq!(opnum, OP_OPEN);
+    assert_eq!(op_status, NfsStat4::Access as u32);
+    assert_eq!(opened.load(Ordering::SeqCst), 1);
 }
 
 /// OPEN with `OPEN4_NOCREATE` on a non-existent file returns `NFS4ERR_NOENT`.

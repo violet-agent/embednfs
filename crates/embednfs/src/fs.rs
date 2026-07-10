@@ -593,6 +593,33 @@ pub trait CommitSupport<H>: Send + Sync {
     ) -> FsResult<()>;
 }
 
+/// Optional close support for filesystems that buffer write data until
+/// the client closes the open state.
+#[async_trait]
+pub trait CloseSupport<H>: Send + Sync {
+    /// Flush buffered writes for an open file before the NFS CLOSE completes.
+    async fn close(&self, ctx: &RequestContext, handle: &H) -> FsResult<()>;
+}
+
+/// Open request shape exposed to optional filesystem open hooks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OpenRequest {
+    /// The client requested read share access.
+    pub read: bool,
+    /// The client requested write share access.
+    pub write: bool,
+}
+
+/// Optional open support for filesystems that need to authorize an OPEN before
+/// the client receives a stateid. This is the only reliable place to surface
+/// errors for shell redirects because later WRITE/COMMIT/CLOSE errors may be
+/// delayed by client-side caching or ignored by shells.
+#[async_trait]
+pub trait OpenSupport<H>: Send + Sync {
+    /// Prepare or authorize an OPEN on an already-resolved object.
+    async fn open(&self, ctx: &RequestContext, handle: &H, request: OpenRequest) -> FsResult<()>;
+}
+
 /// Core filesystem trait implemented by embedders.
 #[async_trait]
 pub trait FileSystem: Send + Sync + 'static {
@@ -718,6 +745,16 @@ pub trait FileSystem: Send + Sync + 'static {
 
     /// Returns optional explicit commit support.
     fn commit_support(&self) -> Option<&dyn CommitSupport<Self::Handle>> {
+        None
+    }
+
+    /// Returns optional explicit close support.
+    fn close_support(&self) -> Option<&dyn CloseSupport<Self::Handle>> {
+        None
+    }
+
+    /// Returns optional explicit open support.
+    fn open_support(&self) -> Option<&dyn OpenSupport<Self::Handle>> {
         None
     }
 }
