@@ -109,15 +109,18 @@ impl StateManager {
         // transport already established for another.
         //
         // `clients.rs` continues to return a hardcoded server_scope of
-        // `"embednfs"`, but we make `major_id` carry a monotonically
-        // increasing counter so every server instance in the process gets
-        // a distinct identity. The atomic is process-global; wraparound
-        // is not a concern for any realistic deployment.
+        // `"embednfs"`, so `major_id` must distinguish both processes and
+        // instances within a process. A process-local counter alone resets
+        // to one on every server restart; Linux then trunks the new server
+        // onto the dead transport retained for the old ephemeral port.
+        // Include the process ID and boot verifier as a per-process nonce,
+        // plus the counter for multiple instances in that process.
         static NEXT_SERVER_OWNER_ID: AtomicU64 = AtomicU64::new(1);
         let instance_id = NEXT_SERVER_OWNER_ID.fetch_add(1, Ordering::Relaxed);
-        let mut major_id = Vec::with_capacity(24);
-        major_id.extend_from_slice(b"embednfs-");
-        major_id.extend_from_slice(instance_id.to_string().as_bytes());
+        let major_id = format!(
+            "embednfs-{}-{verifier_value:016x}-{instance_id}",
+            std::process::id()
+        );
         let server_owner = ServerOwner4 {
             minor_id: 0,
             major_id: Bytes::from(major_id),

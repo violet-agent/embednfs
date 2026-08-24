@@ -52,6 +52,27 @@ fn exchange_id_args(ownerid: &[u8], verifier: Verifier4) -> ExchangeIdArgs4 {
     }
 }
 
+#[test]
+fn server_owner_is_unique_and_namespaced_to_this_process() {
+    let first = StateManager::new();
+    let second = StateManager::new();
+    let process_prefix = format!("embednfs-{}-", std::process::id());
+
+    assert!(
+        first
+            .server_owner
+            .major_id
+            .starts_with(process_prefix.as_bytes())
+    );
+    assert!(
+        second
+            .server_owner
+            .major_id
+            .starts_with(process_prefix.as_bytes())
+    );
+    assert_ne!(first.server_owner.major_id, second.server_owner.major_id);
+}
+
 fn create_session_args(clientid: Clientid4, sequence: Sequenceid4) -> CreateSessionArgs4 {
     CreateSessionArgs4 {
         clientid,
