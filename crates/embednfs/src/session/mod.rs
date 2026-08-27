@@ -63,6 +63,7 @@ impl Default for StateConfig {
 
 use model::StateInner;
 pub(crate) use model::{ResolvedStateid, SequenceCacheToken, SequenceReplay, SynthMeta};
+pub(crate) use sequence::TryFinishSequence;
 pub(crate) use stateids::{CurrentStateidMode, NormalizedStateid};
 
 /// Manages all server-side state.

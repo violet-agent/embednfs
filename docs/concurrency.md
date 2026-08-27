@@ -5,7 +5,7 @@ requests at a time, and what happens when a request cannot finish normally.
 
 ## Connection anatomy
 
-A connection is served by three parts (`src/server/transport/`):
+A connection is served by three parts (`crates/embednfs/src/server/transport/`):
 
 | Part | Owns | Count |
 | --- | --- | --- |

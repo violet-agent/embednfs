@@ -20,7 +20,7 @@ use embednfs_proto::NfsStat4;
 use embednfs_proto::xdr::XdrEncode;
 use tracing::{error, warn};
 
-use crate::session::{SequenceCacheToken, StateManager};
+use crate::session::{SequenceCacheToken, StateManager, TryFinishSequence};
 
 use crate::server::compound::sequence_error_compound;
 
@@ -73,8 +73,13 @@ impl Drop for SequenceFinalizer {
 
         let body = Self::fault_body(&self.tag);
         let state = Arc::clone(&self.state);
-        let Err((token, body)) = state.try_finish_sequence(token, body) else {
-            return;
+        let (token, body) = match state.try_finish_sequence(token, body) {
+            TryFinishSequence::Finished => return,
+            TryFinishSequence::Failed(status) => {
+                warn!("Failed to finalize faulted replay cache entry: {status:?}");
+                return;
+            }
+            TryFinishSequence::Contended(token, body) => (token, body),
         };
 
         // The state lock was contended, and `Drop` cannot await. Hand the

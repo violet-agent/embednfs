@@ -5,6 +5,17 @@ use super::model::{
     CachedReplay, ClientLeaseState, SequenceCacheToken, SequenceReplay, SessionState, StateInner,
 };
 
+/// Outcome of finalizing a slot without awaiting the state lock.
+pub(crate) enum TryFinishSequence {
+    /// The replay cache entry was stored.
+    Finished,
+    /// The state lock was held elsewhere; nothing was written and the caller
+    /// owns the token and response body again.
+    Contended(SequenceCacheToken, Vec<u8>),
+    /// The lock was taken but the slot could not be finalized.
+    Failed(NfsStat4),
+}
+
 impl StateManager {
     fn sequence_res(
         session: &SessionState,
@@ -134,20 +145,22 @@ impl StateManager {
 
     /// Complete a forechannel request without awaiting the state lock.
     ///
-    /// Returns the token and response body unchanged when the lock is
-    /// contended. This exists for the panic/cancellation cleanup path, which
-    /// runs inside `Drop` and therefore cannot await.
+    /// This exists for the panic/cancellation cleanup path, which runs inside
+    /// `Drop` and therefore cannot await. A contended lock hands the token and
+    /// response body back so the caller can retry them asynchronously; a slot
+    /// that could not be finalized at all reports its status instead, so the
+    /// caller does not mistake the failure for a cached reply.
     pub(crate) fn try_finish_sequence(
         &self,
         token: SequenceCacheToken,
         response: Vec<u8>,
-    ) -> Result<(), (SequenceCacheToken, Vec<u8>)> {
+    ) -> TryFinishSequence {
         match self.inner.try_write() {
-            Ok(mut inner) => {
-                let _ = Self::finish_sequence_locked(&mut inner, token, response);
-                Ok(())
-            }
-            Err(_) => Err((token, response)),
+            Ok(mut inner) => match Self::finish_sequence_locked(&mut inner, token, response) {
+                Ok(()) => TryFinishSequence::Finished,
+                Err(status) => TryFinishSequence::Failed(status),
+            },
+            Err(_) => TryFinishSequence::Contended(token, response),
         }
     }
 

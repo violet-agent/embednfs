@@ -43,8 +43,10 @@ impl ControlGate {
     /// Acquires the lane for one request. The returned permit must be held for
     /// the whole request.
     ///
-    /// Returns `None` only if the semaphore were closed, which never happens:
-    /// the gate lives as long as the connection and is never closed.
+    /// Returns `None` if the semaphore is closed. The gate lives as long as the
+    /// connection and is not closed today, but the caller must treat `None` as
+    /// fail-closed: a request that could not take the lane is answered without
+    /// executing rather than run outside the gate.
     async fn acquire(&self, shared: bool) -> Option<SemaphorePermit<'_>> {
         let wanted = if shared {
             1
@@ -161,8 +163,24 @@ impl<F: FileSystem> NfsServer<F> {
 
         let leading_sequence =
             args.minorversion == 1 && matches!(args.argarray.first(), Some(NfsArgop4::Sequence(_)));
-        // Held for the whole request; see `ControlGate`.
-        let _lane = control.acquire(leading_sequence).await;
+        // Held for the whole request; see `ControlGate`. Failing to take the
+        // lane is fail-closed: the request is answered with a status that says
+        // nothing ran, before any session or filesystem work happens.
+        let Some(_lane) = control.acquire(leading_sequence).await else {
+            warn!("Control gate closed; rejecting COMPOUND without executing it");
+            let result = if leading_sequence {
+                sequence_error_compound(&args.tag, NfsStat4::Serverfault)
+            } else {
+                Compound4Res {
+                    status: NfsStat4::Serverfault,
+                    tag: args.tag,
+                    resarray: vec![],
+                }
+            };
+            encode_rpc_reply_accepted(response, call.xid);
+            result.encode(response);
+            return;
+        };
 
         let request_ctx = Self::request_context(&call.cred);
         let mut finalizer = None;
