@@ -286,11 +286,18 @@ impl<F: FileSystem> NfsServer<F> {
         }
     }
 
+    /// Handles READDIR, returning a `READDIR4resok` of at most `max_maxcount`
+    /// bytes.
+    ///
+    /// `max_maxcount` is what is left of the reply's payload budget. RFC 8881
+    /// §18.23.3 makes `maxcount` a ceiling rather than a target, so lowering it
+    /// only means the client pages through the directory in more steps.
     pub(crate) async fn op_readdir(
         &self,
         request_ctx: &RequestContext,
         args: &ReaddirArgs4,
         current_fh: &Option<NfsFh4>,
+        max_maxcount: u32,
     ) -> NfsResop4 {
         let (_, object) = match self.resolve_object(current_fh).await {
             Ok(resolved) => resolved,
@@ -325,7 +332,11 @@ impl<F: FileSystem> NfsServer<F> {
         }
 
         let with_attrs = args.attr_request.0.iter().any(|word| *word != 0);
-        let backend_max_entries = (args.maxcount / 128).max(1);
+        // Clamped before it sizes the backend request: `maxcount` is a
+        // client-supplied 32-bit count, and this is what stops it asking the
+        // filesystem for tens of millions of entries.
+        let maxcount = args.maxcount.min(max_maxcount);
+        let backend_max_entries = (maxcount / 128).max(1);
         let (entries, backend_eof) = match object.clone() {
             ServerObject::Fs(dir_id) => match self
                 .readdir(
@@ -396,7 +407,7 @@ impl<F: FileSystem> NfsServer<F> {
             }
         };
 
-        let maxcount_limit = args.maxcount as usize;
+        let maxcount_limit = maxcount as usize;
         let dircount_limit = if args.dircount == 0 {
             usize::MAX
         } else {

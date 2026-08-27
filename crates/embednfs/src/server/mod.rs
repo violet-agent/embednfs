@@ -27,17 +27,33 @@ const CONN_BUF_SIZE: usize = 65_536;
 /// concurrently.
 ///
 /// This matches the advertised NFSv4.1 forechannel slot limit
-/// (`fore_chan_attrs.maxrequests`), so a well-behaved client that keeps every
-/// slot busy is never throttled by the server, while a client that pipelines
-/// beyond its slot table is bounded.
+/// (`fore_chan_attrs.maxrequests`), so a client that keeps every slot of *one*
+/// session busy is never throttled by the server.
+///
+/// The budget is per connection and the slot table is per session, so a client
+/// that pipelines beyond its slot table — or runs several sessions over one
+/// connection — is bounded by it, as is any client when this is configured
+/// lower. That is deliberate backpressure: the excess waits in the socket
+/// receive buffer under TCP flow control rather than in server memory, and is
+/// delayed rather than failed. See `docs/concurrency.md`.
 pub const DEFAULT_MAX_CONCURRENT_REQUESTS: usize = MAX_FORE_CHAN_SLOTS as usize;
+
+/// Permits in a connection's control gate.
+///
+/// One permit is a shared (forechannel) holder; taking all of them is the
+/// exclusive lane. Both the gate's capacity and an exclusive acquisition are
+/// spelled from this single value, so the two can never drift apart and leave
+/// the exclusive lane permanently unsatisfiable.
+const CONTROL_GATE_PERMITS: u32 = 1024;
 
 /// Hard upper bound for [`NfsServerBuilder::max_concurrent_requests`].
 ///
 /// Per-connection concurrency is always bounded: requests are not read off the
 /// socket until execution capacity is available, so this value also caps how
-/// many request and response bodies a connection can hold in memory.
-pub const MAX_CONCURRENT_REQUESTS_LIMIT: usize = 1024;
+/// many request and response bodies a connection can hold in memory. It equals
+/// the control gate's capacity, so a connection running at the maximum can
+/// still fill the shared lane.
+pub const MAX_CONCURRENT_REQUESTS_LIMIT: usize = CONTROL_GATE_PERMITS as usize;
 
 type NfsResult<T> = FsResult<T>;
 
@@ -45,6 +61,7 @@ mod compound;
 mod file_attrs;
 mod objects;
 mod ops;
+mod response_budget;
 mod transport;
 
 /// Maps numeric ids to NFS owner/group strings.

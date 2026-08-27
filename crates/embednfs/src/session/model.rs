@@ -102,12 +102,43 @@ pub(super) struct SessionState {
     pub clientid: Clientid4,
     pub slots: Vec<SlotState>,
     pub connections: HashSet<u64>,
+    pub fore_limits: ForeChannelLimits,
+}
+
+/// The forechannel reply sizes this session negotiated in CREATE_SESSION.
+///
+/// Both values count the XDR-encoded reply including the RPC reply header but
+/// excluding the record marking header (RFC 8881 §18.36.3, `ca_maxrequestsize`
+/// definition). They are the server's replies to the client's offer, so they
+/// are always values this server chose and can honour.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ForeChannelLimits {
+    /// `ca_maxresponsesize`: the largest reply the client will accept.
+    pub max_response_size: u32,
+    /// `ca_maxresponsesize_cached`: the largest reply the server stores in the
+    /// slot's replay cache.
+    pub max_response_size_cached: u32,
+}
+
+/// What a finished slot hands back to a retry of the same request.
+#[derive(Clone)]
+pub(super) enum CachedResponse {
+    /// The complete encoded `Compound4Res` body, replayed verbatim.
+    Body(Vec<u8>),
+    /// The request executed, but its reply did not fit
+    /// `ca_maxresponsesize_cached` and was therefore not stored.
+    ///
+    /// RFC 8881 §2.10.6.1.3 allows exactly this: a replier that does not cache
+    /// a reply answers the retry with the SEQUENCE result plus
+    /// NFS4ERR_RETRY_UNCACHED_REP on the following operation. The slot stays
+    /// consumed, so the request is never executed a second time.
+    Uncached,
 }
 
 #[derive(Clone)]
 pub(super) struct CachedReplay {
     pub fingerprint: Vec<u8>,
-    pub response: Vec<u8>,
+    pub response: CachedResponse,
 }
 
 #[derive(Clone)]
@@ -121,11 +152,19 @@ pub(crate) struct SequenceCacheToken {
     pub sessionid: Sessionid4,
     pub slotid: Slotid4,
     pub fingerprint: Vec<u8>,
+    /// Captured at prepare time so finalization never has to look the session
+    /// up twice, and so a slot is judged against the limits its own session
+    /// negotiated.
+    pub limits: ForeChannelLimits,
 }
 
 pub(crate) enum SequenceReplay {
     Execute(SequenceRes4, SequenceCacheToken),
     Replay(Vec<u8>),
+    /// A matching retry of a request whose reply was too large to cache. The
+    /// caller answers with this SEQUENCE result and NFS4ERR_RETRY_UNCACHED_REP
+    /// on the next operation.
+    Uncached(SequenceRes4),
     StatusOnly(SequenceRes4),
     Error(embednfs_proto::NfsStat4),
 }

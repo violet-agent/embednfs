@@ -26,7 +26,18 @@ mod tests;
 /// Maximum number of forechannel slots advertised for a session, i.e. the
 /// highest number of requests a client may have outstanding at once.
 pub(crate) const MAX_FORE_CHAN_SLOTS: u32 = 64;
+/// Largest forechannel request size this server will agree to in
+/// CREATE_SESSION, whatever the client offers.
 const MAX_REQUEST_SIZE: u32 = 1_049_620;
+/// Largest forechannel reply size this server will agree to.
+///
+/// It matches [`MAX_REQUEST_SIZE`] because both bound one RPC record on the
+/// same connection. It is also the ceiling applied to a COMPOUND that runs
+/// without a session, which has no negotiated limit of its own.
+pub(crate) const MAX_RESPONSE_SIZE: u32 = MAX_REQUEST_SIZE;
+/// Largest reply this server will store in a slot's replay cache, and so the
+/// ceiling on `ca_maxresponsesize_cached`. With one entry per slot this bounds
+/// a session's replay cache at `MAX_FORE_CHAN_SLOTS * MAX_CACHED_RESPONSE`.
 const MAX_CACHED_RESPONSE: u32 = 6144;
 const SYNTH_FILEID_BASE: u64 = 1u64 << 63;
 pub(crate) const DEFAULT_LEASE_TIME_SECS: u32 = 90;
@@ -62,7 +73,9 @@ impl Default for StateConfig {
 }
 
 use model::StateInner;
-pub(crate) use model::{ResolvedStateid, SequenceCacheToken, SequenceReplay, SynthMeta};
+pub(crate) use model::{
+    ForeChannelLimits, ResolvedStateid, SequenceCacheToken, SequenceReplay, SynthMeta,
+};
 pub(crate) use sequence::TryFinishSequence;
 pub(crate) use stateids::{CurrentStateidMode, NormalizedStateid};
 

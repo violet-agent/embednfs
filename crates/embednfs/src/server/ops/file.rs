@@ -481,6 +481,14 @@ impl<F: FileSystem> NfsServer<F> {
         )
     }
 
+    /// Handles READ, returning at most `max_count` bytes.
+    ///
+    /// `max_count` is what is left of the reply's payload budget, so the count
+    /// the client asked for never reaches the backend unclamped. Returning
+    /// fewer bytes than requested is explicitly permitted (RFC 8881 §18.22.3),
+    /// and the client reads the remainder with its next READ; the stateid check
+    /// still uses the requested range, because that is the range the client
+    /// claims access to.
     pub(crate) async fn op_read(
         &self,
         request_ctx: &RequestContext,
@@ -488,6 +496,7 @@ impl<F: FileSystem> NfsServer<F> {
         current_fh: &Option<NfsFh4>,
         current_stateid: Option<Stateid4>,
         sequence_clientid: Option<Clientid4>,
+        max_count: u32,
     ) -> NfsResop4 {
         let (_, object) = match self.resolve_object(current_fh).await {
             Ok(resolved) => resolved,
@@ -511,6 +520,7 @@ impl<F: FileSystem> NfsServer<F> {
             return NfsResop4::Read(status, None);
         }
 
+        let count = args.count.min(max_count);
         let result = match object {
             ServerObject::Fs(id) => {
                 // RFC 8881 §18.22.3: READ on a directory must return NFS4ERR_ISDIR.
@@ -521,10 +531,10 @@ impl<F: FileSystem> NfsServer<F> {
                     Err(e) => return NfsResop4::Read(e.to_nfsstat4(), None),
                     _ => {}
                 }
-                self.read(request_ctx, id, args.offset, args.count).await
+                self.read(request_ctx, id, args.offset, count).await
             }
             ServerObject::NamedAttrFile { parent, name } => {
-                self.xattr_read_slice(request_ctx, parent, &name, args.offset, args.count)
+                self.xattr_read_slice(request_ctx, parent, &name, args.offset, count)
                     .await
             }
             ServerObject::NamedAttrDir(_) => Err(FsError::IsDirectory),

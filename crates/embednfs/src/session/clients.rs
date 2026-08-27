@@ -9,8 +9,12 @@ use embednfs_proto::{
     SEQ4_STATUS_EXPIRED_ALL_STATE_REVOKED, Sessionid4, StateProtect4R,
 };
 
-use super::model::{ClientLeaseState, ClientState, SessionState, SlotState, StateInner};
-use super::{MAX_CACHED_RESPONSE, MAX_FORE_CHAN_SLOTS, MAX_REQUEST_SIZE, StateManager};
+use super::model::{
+    ClientLeaseState, ClientState, ForeChannelLimits, SessionState, SlotState, StateInner,
+};
+use super::{
+    MAX_CACHED_RESPONSE, MAX_FORE_CHAN_SLOTS, MAX_REQUEST_SIZE, MAX_RESPONSE_SIZE, StateManager,
+};
 
 impl StateManager {
     /// Handle EXCHANGE_ID.
@@ -163,7 +167,7 @@ impl StateManager {
         let fore_chan = ChannelAttrs4 {
             headerpadsize: 0,
             maxrequestsize: args.fore_chan_attrs.maxrequestsize.min(MAX_REQUEST_SIZE),
-            maxresponsesize: args.fore_chan_attrs.maxresponsesize.min(MAX_REQUEST_SIZE),
+            maxresponsesize: args.fore_chan_attrs.maxresponsesize.min(MAX_RESPONSE_SIZE),
             maxresponsesize_cached: args
                 .fore_chan_attrs
                 .maxresponsesize_cached
@@ -189,6 +193,12 @@ impl StateManager {
                 clientid: args.clientid,
                 slots,
                 connections: HashSet::from([connection_id]),
+                // The values the server is about to return, not the ones the
+                // client asked for: those are what both sides are bound by.
+                fore_limits: ForeChannelLimits {
+                    max_response_size: fore_chan.maxresponsesize,
+                    max_response_size_cached: fore_chan.maxresponsesize_cached,
+                },
             },
         );
 

@@ -9,11 +9,19 @@ use embednfs_proto::{FATTR4_SIZE, Fattr4, NfsStat4, OP_READ, OP_SEQUENCE, Opaque
 use super::NOT_YET_WINDOW;
 use crate::common::*;
 
-const LARGE_READ_BYTES: usize = 3 * 1024 * 1024;
+/// Large enough that the two replies overlap in the writer, small enough to fit
+/// the `ca_maxresponsesize` the test session negotiates.
+const LARGE_READ_BYTES: usize = 512 * 1024;
 const OVERSIZED_FRAGMENT: u32 = 3 * 1024 * 1024;
 
 /// Two large replies that complete in the opposite order to their requests are
 /// written as two intact, non-interleaved RPC records, each correlated by XID.
+///
+/// Each reply is a single record: the negotiated `ca_maxresponsesize` keeps a
+/// COMPOUND reply below the outbound fragment size, so the writer's
+/// fragmentation loop is exercised by
+/// `server::transport::tests::test_a_reply_larger_than_the_fragment_size_is_split`
+/// instead.
 /// Origin: RFC 5531 record framing under out-of-order completion on one connection.
 /// RFC: RFC 5531 §11; RFC 8881 §2.10.6.1, §18.22.3.
 #[tokio::test]
@@ -59,10 +67,7 @@ async fn test_inverted_completion_order_writes_intact_records() {
     let (mut first, fragments) = timeout(NOT_YET_WINDOW * 20, read_rpc_record(&mut stream))
         .await
         .expect("fast reply arrives first");
-    assert!(
-        fragments > 1,
-        "expected a multi-fragment reply, got {fragments}"
-    );
+    assert_eq!(fragments, 1, "the reply fits one record");
     let (xid, accept_stat) = parse_rpc_reply_fields(&mut first);
     assert_eq!(xid, 4, "the second request completed first");
     assert_eq!(accept_stat, 0);
@@ -87,7 +92,7 @@ async fn test_inverted_completion_order_writes_intact_records() {
     let (mut second, fragments) = timeout(NOT_YET_WINDOW * 20, read_rpc_record(&mut stream))
         .await
         .expect("blocked reply");
-    assert!(fragments > 1);
+    assert_eq!(fragments, 1);
     let (xid, accept_stat) = parse_rpc_reply_fields(&mut second);
     assert_eq!(xid, 3);
     assert_eq!(accept_stat, 0);

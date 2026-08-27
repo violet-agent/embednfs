@@ -85,6 +85,18 @@ pub fn encode_exchange_id_with_ssv(
 }
 
 pub fn encode_create_session(clientid: u64, seq: u32) -> Vec<u8> {
+    encode_create_session_with_fore_limits(clientid, seq, 1_048_576, 8192)
+}
+
+/// CREATE_SESSION whose forechannel `ca_maxresponsesize` and
+/// `ca_maxresponsesize_cached` offers the caller chooses, so a test can
+/// negotiate a deliberately small reply or reply-cache size.
+pub fn encode_create_session_with_fore_limits(
+    clientid: u64,
+    seq: u32,
+    maxresponsesize: u32,
+    maxresponsesize_cached: u32,
+) -> Vec<u8> {
     let mut buf = BytesMut::new();
     OP_CREATE_SESSION.encode(&mut buf);
     clientid.encode(&mut buf);
@@ -93,8 +105,8 @@ pub fn encode_create_session(clientid: u64, seq: u32) -> Vec<u8> {
 
     0u32.encode(&mut buf);
     1_048_576u32.encode(&mut buf);
-    1_048_576u32.encode(&mut buf);
-    8192u32.encode(&mut buf);
+    maxresponsesize.encode(&mut buf);
+    maxresponsesize_cached.encode(&mut buf);
     16u32.encode(&mut buf);
     8u32.encode(&mut buf);
     0u32.encode(&mut buf);

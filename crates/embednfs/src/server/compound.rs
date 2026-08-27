@@ -3,16 +3,18 @@ use tracing::{debug, trace};
 use embednfs_proto::*;
 
 use crate::fs::{FileSystem, RequestContext};
-use crate::session::{CurrentStateidMode, NormalizedStateid};
+use crate::session::{CurrentStateidMode, ForeChannelLimits, NormalizedStateid};
 
 use super::NfsServer;
+use super::response_budget::{ResponseBudget, compound_has_payload_op};
 
-#[derive(Default)]
 struct CompoundExecutionState {
     current_fh: Option<NfsFh4>,
     current_stateid: Option<Stateid4>,
     saved_fh: Option<NfsFh4>,
     saved_stateid: Option<Stateid4>,
+    /// Room left in the reply for bulk payload; see [`ResponseBudget`].
+    response: ResponseBudget,
 }
 
 impl<F: FileSystem> NfsServer<F> {
@@ -22,6 +24,7 @@ impl<F: FileSystem> NfsServer<F> {
         mut prepared_sequence: Option<NfsResop4>,
         request_ctx: &RequestContext,
         connection_id: u64,
+        session_limits: Option<ForeChannelLimits>,
     ) -> Compound4Res {
         let op_names: Vec<&'static str> = args.argarray.iter().map(argop_name).collect();
         debug!(
@@ -79,7 +82,19 @@ impl<F: FileSystem> NfsServer<F> {
             }
         }
 
-        let mut compound_state = CompoundExecutionState::default();
+        let mut compound_state = CompoundExecutionState {
+            current_fh: None,
+            current_stateid: None,
+            saved_fh: None,
+            saved_stateid: None,
+            response: {
+                let measured = compound_has_payload_op(&args.argarray);
+                match session_limits {
+                    Some(limits) => ResponseBudget::for_session(limits, &args.tag, measured),
+                    None => ResponseBudget::unsequenced(&args.tag, measured),
+                }
+            },
+        };
         let mut resarray = Vec::with_capacity(total_ops);
         let mut overall_status = NfsStat4::Ok;
 
@@ -156,6 +171,10 @@ impl<F: FileSystem> NfsServer<F> {
             if status != NfsStat4::Ok {
                 debug!("  op failed: status={:?}", status);
             }
+            // Charged before the next operation runs, so a second payload
+            // operation sees what the first one actually returned rather than
+            // the full budget again.
+            compound_state.response.consume(&res);
             apply_compound_state_transition(&op, &res, &mut compound_state);
             resarray.push(res);
 
@@ -243,10 +262,19 @@ impl<F: FileSystem> NfsServer<F> {
                     &state.current_fh,
                     state.current_stateid,
                     sequence_clientid,
+                    state.response.read_limit(),
                 )
                 .await
             }
-            NfsArgop4::Readdir(args) => self.op_readdir(request_ctx, args, &state.current_fh).await,
+            NfsArgop4::Readdir(args) => {
+                self.op_readdir(
+                    request_ctx,
+                    args,
+                    &state.current_fh,
+                    state.response.readdir_limit(),
+                )
+                .await
+            }
             NfsArgop4::Readlink => self.op_readlink(request_ctx, &state.current_fh).await,
             NfsArgop4::Remove(args) => self.op_remove(request_ctx, args, &state.current_fh).await,
             NfsArgop4::Rename(args) => {
@@ -472,6 +500,43 @@ pub(super) fn sequence_only_compound(tag: &str, res: SequenceRes4) -> Compound4R
         status: NfsStat4::Ok,
         tag: tag.to_string(),
         resarray: vec![NfsResop4::Sequence(NfsStat4::Ok, Some(res))],
+    }
+}
+
+/// Reply to a matching retry whose original reply was too large to cache.
+///
+/// RFC 8881 §2.10.6.1.3 spells this shape out: the SEQUENCE result succeeds —
+/// returning NFS4ERR_RETRY_UNCACHED_REP on a *leading* SEQUENCE is forbidden —
+/// and the following operation, "as it appeared in the retried request",
+/// carries the error. The request itself is never executed again, so the
+/// exactly-once guarantee the slot exists for still holds.
+///
+/// The same section requires an illegal operation, or one this minor version
+/// must not support, to keep its own error instead.
+pub(super) fn uncached_replay_compound(
+    tag: &str,
+    seq_res: SequenceRes4,
+    second_op: Option<&NfsArgop4>,
+) -> Compound4Res {
+    // A COMPOUND that is nothing but SEQUENCE has no second operation to carry
+    // the error, and its reply is small enough that it is always cached; if one
+    // ever reaches here, the SEQUENCE result alone is the complete reply.
+    let Some(second_op) = second_op else {
+        return sequence_only_compound(tag, seq_res);
+    };
+
+    let status = match second_op {
+        NfsArgop4::Illegal => NfsStat4::OpIllegal,
+        NfsArgop4::MustNotImplement(_) => NfsStat4::Notsupp,
+        _ => NfsStat4::RetryUncachedRep,
+    };
+    Compound4Res {
+        status,
+        tag: tag.to_string(),
+        resarray: vec![
+            NfsResop4::Sequence(NfsStat4::Ok, Some(seq_res)),
+            error_res_for_op(second_op, status),
+        ],
     }
 }
 

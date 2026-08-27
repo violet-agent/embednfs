@@ -33,10 +33,27 @@ Consequences:
   make it hold two budgets' worth. Unread records stay in the socket receive
   buffer and TCP flow control pushes back on the client.
   The default limit is `DEFAULT_MAX_CONCURRENT_REQUESTS` (64), which equals the
-  advertised forechannel slot count (`fore_chan_attrs.maxrequests`), so a
-  conforming client is never throttled below its own slot table.
+  advertised forechannel slot count (`fore_chan_attrs.maxrequests`).
   `NfsServerBuilder::max_concurrent_requests` adjusts it within
   `1..=MAX_CONCURRENT_REQUESTS_LIMIT`; `1` restores fully serialized handling.
+
+  **The "never throttled" property is per session, and only at the default.**
+  The budget is per *connection*, while the slot table is per *session*, so it
+  is exactly one full slot table's worth of requests. A client that keeps every
+  slot of a single session busy is never throttled below its slot table; a
+  client that runs several sessions over one connection, or that pipelines
+  beyond its slot table, can have more requests outstanding than the budget
+  covers, and so can any client once `max_concurrent_requests` is configured
+  below 64.
+
+  Throttling in those cases is intentional backpressure, not a defect. The
+  server stops reading records rather than queueing them, so the excess waits
+  in the socket receive buffer under TCP flow control instead of in server
+  memory; the requests are delayed, never dropped or failed, and the bound on
+  memory per connection holds whatever the client does. A deployment that wants
+  several busy sessions to share a connection without waiting should raise
+  `max_concurrent_requests` to cover their combined slot tables, at a
+  proportional cost in worst-case memory per connection.
 
 ## Lanes
 

@@ -2,7 +2,7 @@ use embednfs_proto::{NfsStat4, SequenceArgs4, SequenceRes4};
 
 use super::StateManager;
 use super::model::{
-    CachedReplay, ClientLeaseState, SequenceCacheToken, SequenceReplay, SessionState, StateInner,
+    CachedReplay, CachedResponse, ClientLeaseState, SequenceCacheToken, SequenceReplay, StateInner,
 };
 
 /// Outcome of finalizing a slot without awaiting the state lock.
@@ -28,12 +28,12 @@ impl StateManager {
         self.inner.write().await
     }
 
-    fn sequence_res(
-        session: &SessionState,
-        args: &SequenceArgs4,
-        status_flags: u32,
-    ) -> SequenceRes4 {
-        let highest_slot = (session.slots.len() - 1) as u32;
+    /// Builds the SEQUENCE result for a session with `slot_count` slots.
+    ///
+    /// Taking the slot count rather than the session keeps this callable while
+    /// a single slot is mutably borrowed out of the same session.
+    fn sequence_res(slot_count: usize, args: &SequenceArgs4, status_flags: u32) -> SequenceRes4 {
+        let highest_slot = slot_count.saturating_sub(1) as u32;
         SequenceRes4 {
             sessionid: args.sessionid,
             sequenceid: args.sequenceid,
@@ -77,7 +77,11 @@ impl StateManager {
                 return SequenceReplay::Error(NfsStat4::BadSession);
             };
             let _ = session.connections.insert(connection_id);
-            return SequenceReplay::StatusOnly(Self::sequence_res(session, args, status_flags));
+            return SequenceReplay::StatusOnly(Self::sequence_res(
+                session.slots.len(),
+                args,
+                status_flags,
+            ));
         }
 
         let replay = {
@@ -85,6 +89,7 @@ impl StateManager {
                 return SequenceReplay::Error(NfsStat4::BadSession);
             };
             let _ = session.connections.insert(connection_id);
+            let limits = session.fore_limits;
             let slot = &mut session.slots[slot_idx];
             let retry_seq = slot.sequence_id.wrapping_sub(1);
 
@@ -101,13 +106,14 @@ impl StateManager {
                     slot.sequence_id = slot.sequence_id.wrapping_add(1);
                     slot.in_progress = Some(fingerprint.to_vec());
                     slot.cached_reply = None;
-                    let res = Self::sequence_res(session, args, 0);
+                    let res = Self::sequence_res(slot_count, args, 0);
                     SequenceReplay::Execute(
                         res,
                         SequenceCacheToken {
                             sessionid: args.sessionid,
                             slotid: args.slotid,
                             fingerprint: fingerprint.to_vec(),
+                            limits,
                         },
                     )
                 }
@@ -120,10 +126,20 @@ impl StateManager {
                     SequenceReplay::Error(NfsStat4::SeqFalseRetry)
                 }
             } else if let Some(cached) = &slot.cached_reply {
-                if cached.fingerprint == fingerprint {
-                    SequenceReplay::Replay(cached.response.clone())
-                } else {
+                if cached.fingerprint != fingerprint {
                     SequenceReplay::Error(NfsStat4::SeqFalseRetry)
+                } else {
+                    match &cached.response {
+                        CachedResponse::Body(body) => SequenceReplay::Replay(body.clone()),
+                        // The slot is spent either way; only the reply the
+                        // client gets differs. RFC 8881 §2.10.6.1.3 forbids
+                        // NFS4ERR_RETRY_UNCACHED_REP on a leading SEQUENCE, so
+                        // the SEQUENCE result is a normal success and the
+                        // caller puts the error on the operation after it.
+                        CachedResponse::Uncached => {
+                            SequenceReplay::Uncached(Self::sequence_res(slot_count, args, 0))
+                        }
+                    }
                 }
             } else {
                 SequenceReplay::Error(NfsStat4::Serverfault)
@@ -132,7 +148,7 @@ impl StateManager {
 
         if matches!(
             replay,
-            SequenceReplay::Execute(_, _) | SequenceReplay::Replay(_)
+            SequenceReplay::Execute(_, _) | SequenceReplay::Replay(_) | SequenceReplay::Uncached(_)
         ) && let Some(client) = inner.clients.get_mut(&clientid)
         {
             client.lease_state = ClientLeaseState::Active {
@@ -195,6 +211,14 @@ impl StateManager {
 
     /// Stores the reply, or hands the token back with the status that stopped
     /// it so the caller can decide on a fallback.
+    ///
+    /// A reply larger than the `ca_maxresponsesize_cached` this session
+    /// negotiated is dropped instead of stored (RFC 8881 §18.36.3: the replier
+    /// stores no reply bigger than that value), which is what keeps a slot
+    /// table from holding one full-sized reply per slot. Dropping the body does
+    /// *not* make the slot reusable: the entry is still recorded, marked
+    /// uncached, so the consumed sequence id and the fingerprint check both
+    /// stand and the request can never execute twice.
     fn finish_sequence_locked(
         inner: &mut StateInner,
         token: SequenceCacheToken,
@@ -208,10 +232,15 @@ impl StateManager {
             return Err((NfsStat4::BadSlot, token));
         };
 
+        let cacheable = response.len() <= token.limits.max_response_size_cached as usize;
         slot.in_progress = None;
         slot.cached_reply = Some(CachedReplay {
             fingerprint: token.fingerprint,
-            response,
+            response: if cacheable {
+                CachedResponse::Body(response)
+            } else {
+                CachedResponse::Uncached
+            },
         });
         Ok(())
     }

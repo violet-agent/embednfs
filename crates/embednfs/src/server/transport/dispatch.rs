@@ -12,10 +12,10 @@ use crate::fs::FileSystem;
 use crate::session::SequenceReplay;
 
 use super::replay::SequenceFinalizer;
-use crate::server::compound::{sequence_error_compound, sequence_only_compound};
-use crate::server::{
-    Compound4Res, MAX_CONCURRENT_REQUESTS_LIMIT, NfsServer, hex_bytes, replay_fingerprint,
+use crate::server::compound::{
+    sequence_error_compound, sequence_only_compound, uncached_replay_compound,
 };
+use crate::server::{CONTROL_GATE_PERMITS, Compound4Res, NfsServer, hex_bytes, replay_fingerprint};
 
 /// Serializes control traffic against forechannel traffic on one connection.
 ///
@@ -36,10 +36,19 @@ pub(super) struct ControlGate {
     permits: Semaphore,
 }
 
+/// The gate is filled with, and exclusively drained of, the same count.
+///
+/// This is the deadlock invariant: `acquire_many` waits for as many permits as
+/// it was asked for and never gives up, so an exclusive acquisition of more
+/// permits than the gate was created with would block forever. Both numbers are
+/// [`CONTROL_GATE_PERMITS`], with no conversion in between that could round or
+/// saturate, so there is nothing to keep in sync by hand.
+const _: () = assert!(CONTROL_GATE_PERMITS as usize <= Semaphore::MAX_PERMITS);
+
 impl ControlGate {
     pub(super) fn new() -> Self {
         Self {
-            permits: Semaphore::new(MAX_CONCURRENT_REQUESTS_LIMIT),
+            permits: Semaphore::new(CONTROL_GATE_PERMITS as usize),
         }
     }
 
@@ -51,11 +60,7 @@ impl ControlGate {
     /// fail-closed: a request that could not take the lane is answered without
     /// executing rather than run outside the gate.
     async fn acquire(&self, shared: bool) -> Option<SemaphorePermit<'_>> {
-        let wanted = if shared {
-            1
-        } else {
-            u32::try_from(MAX_CONCURRENT_REQUESTS_LIMIT).unwrap_or(u32::MAX)
-        };
+        let wanted = if shared { 1 } else { CONTROL_GATE_PERMITS };
         self.permits.acquire_many(wanted).await.ok()
     }
 }
@@ -217,6 +222,7 @@ impl<F: FileSystem> NfsServer<F> {
 
         let request_ctx = Self::request_context(&call.cred);
         let mut finalizer = None;
+        let mut session_limits = None;
         let prepared_sequence = match args.argarray.first() {
             Some(NfsArgop4::Sequence(seq_args)) if leading_sequence => {
                 let fingerprint = replay_fingerprint(&call.cred, &compound_payload);
@@ -226,6 +232,9 @@ impl<F: FileSystem> NfsServer<F> {
                     .await
                 {
                     SequenceReplay::Execute(res, token) => {
+                        // Every reply size this COMPOUND is held to comes from
+                        // the session it named, never from another one.
+                        session_limits = Some(token.limits);
                         finalizer = Some(SequenceFinalizer::new(
                             std::sync::Arc::clone(&self.state),
                             token,
@@ -236,6 +245,13 @@ impl<F: FileSystem> NfsServer<F> {
                     SequenceReplay::Replay(cached) => {
                         encode_rpc_reply_accepted(response, call.xid);
                         response.extend_from_slice(&cached);
+                        return;
+                    }
+                    SequenceReplay::Uncached(seq_res) => {
+                        let result =
+                            uncached_replay_compound(&args.tag, seq_res, args.argarray.get(1));
+                        encode_rpc_reply_accepted(response, call.xid);
+                        result.encode(response);
                         return;
                     }
                     SequenceReplay::StatusOnly(res) => {
@@ -256,7 +272,13 @@ impl<F: FileSystem> NfsServer<F> {
         };
 
         let result = self
-            .handle_compound(args, prepared_sequence, &request_ctx, connection_id)
+            .handle_compound(
+                args,
+                prepared_sequence,
+                &request_ctx,
+                connection_id,
+                session_limits,
+            )
             .await;
         encode_rpc_reply_accepted(response, call.xid);
         let body_start = response.len();

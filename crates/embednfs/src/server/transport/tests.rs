@@ -36,10 +36,11 @@ use crate::fs::{
     Symlinks, WriteResult, WriteStability, Xattrs,
 };
 use crate::memfs::MemFs;
-use crate::server::NfsServer;
 use crate::server::compound::sequence_error_compound;
+use crate::server::{MAX_FRAGMENT_SIZE, NfsServer, RPC_FRAG_LEN_MASK, RPC_LAST_FRAGMENT};
 use crate::session::{SequenceReplay, StateManager};
 
+use super::record::{QueuedResponse, response_writer};
 use super::replay::SequenceFinalizer;
 
 /// `MemFs` that counts the `getattr` calls reaching the backend, which is how
@@ -597,5 +598,87 @@ async fn test_no_record_is_dispatched_after_a_response_write_fails() {
             SequenceReplay::Execute(_, _)
         ),
         "the slot of the undispatched record must still be untouched"
+    );
+}
+
+/// Write half that keeps every byte it is handed, so a test can inspect the
+/// exact record framing the writer produced.
+struct RecordingWriter {
+    written: Arc<Mutex<Vec<u8>>>,
+}
+
+impl AsyncWrite for RecordingWriter {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        self.written.lock().unwrap().extend_from_slice(buf);
+        Poll::Ready(Ok(buf.len()))
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+}
+
+/// A reply longer than one record fragment is written as several fragments of
+/// one record, only the last of which sets the last-fragment bit.
+///
+/// A COMPOUND reply can no longer reach this size over the wire — the
+/// negotiated `ca_maxresponsesize` is capped below `MAX_FRAGMENT_SIZE`
+/// (`server::response_budget`) — so the writer's fragmentation loop is driven
+/// directly here rather than through a socket.
+/// Origin: coverage moved from `tests/transport_fragmentation.rs` when the negotiated response size made an oversized reply unreachable.
+/// RFC: RFC 5531 §11.
+#[tokio::test]
+async fn test_a_reply_larger_than_the_fragment_size_is_split() {
+    let body_len = MAX_FRAGMENT_SIZE + 7;
+    let capacity = Arc::new(tokio::sync::Semaphore::new(1));
+    let permit = Arc::clone(&capacity).acquire_owned().await.unwrap();
+    let (responses_tx, responses_rx) = tokio::sync::mpsc::channel(1);
+    responses_tx
+        .send(QueuedResponse::new(
+            Bytes::from(vec![0x5a; body_len]),
+            permit,
+        ))
+        .await
+        .unwrap_or_else(|_| panic!("the writer has not started yet"));
+    std::mem::drop(responses_tx);
+
+    let written = Arc::new(Mutex::new(Vec::new()));
+    response_writer(
+        RecordingWriter {
+            written: Arc::clone(&written),
+        },
+        responses_rx,
+    )
+    .await
+    .unwrap();
+
+    let written = written.lock().unwrap().clone();
+    let mut fragments = Vec::new();
+    let mut rest = &written[..];
+    loop {
+        let (header, tail) = rest.split_at(4);
+        let header = u32::from_be_bytes(header.try_into().unwrap());
+        let len = (header & RPC_FRAG_LEN_MASK) as usize;
+        let last = (header & RPC_LAST_FRAGMENT) != 0;
+        fragments.push((len, last));
+        rest = &tail[len..];
+        if last {
+            break;
+        }
+    }
+
+    assert!(rest.is_empty(), "no bytes trail the final fragment");
+    assert_eq!(
+        fragments,
+        vec![(MAX_FRAGMENT_SIZE, false), (7, true)],
+        "the body is split at the fragment size and only the tail is marked last"
     );
 }

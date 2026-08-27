@@ -41,10 +41,15 @@ impl SequenceFinalizer {
         }
     }
 
-    /// Caches the final encoded `Compound4Res` body for the slot.
+    /// Finalizes the slot with the final encoded `Compound4Res` body.
     ///
     /// Must be called before the reply is published to the response writer so
     /// that a retry never races ahead of the replay cache entry.
+    ///
+    /// The body is stored only if it fits the `ca_maxresponsesize_cached` the
+    /// session negotiated; a larger one finalizes the slot without keeping the
+    /// bytes, which is why one connection's replies cannot pile up in the slot
+    /// table. Either way the slot is spent, so the request never runs twice.
     ///
     /// The token stays owned by `self` across the await, so this is
     /// cancellation-safe: a worker cancelled while waiting for the state lock,
