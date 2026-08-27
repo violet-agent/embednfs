@@ -71,12 +71,21 @@ The slot table, not the worker pool, decides what may execute:
   `prepare_sequence` it is never cancelled. It finishes execution, finalizes the
   replay cache entry, and only then tries to publish; a failed publish is
   dropped. The client picks the result up from the replay cache when it retries
-  on a new connection. The connection task waits for its workers before exiting,
-  so cleanup is never orphaned mid-flight.
+  on a new connection. The connection task reclaims its full execution capacity
+  before exiting, which waits for every dispatched worker even when the writer
+  is the part that died, so cleanup is never orphaned mid-flight.
+* **The writer is watched while the next record is read.** A reply for a record
+  read after the write half broke could never be delivered, so the reader stops
+  at the first observed writer failure: no *new* record is dispatched, and no
+  side effects are committed for a request whose outcome the client can never
+  learn. Records already dispatched still run to completion and finalize.
 * **Panic or task cancellation between prepare and finish.** A worker that dies
   in that window would otherwise leave the slot in-progress forever. A drop
   guard (`transport/replay.rs`) instead finalizes the slot with a replayable
-  NFS4ERR_SERVERFAULT COMPOUND. The slot is *not* silently made reusable,
+  NFS4ERR_SERVERFAULT COMPOUND. `finish` keeps the slot token until the reply is
+  actually cached — awaiting the state lock is its only cancellation point — so
+  a worker cancelled there, or one whose finalization fails, still falls back to
+  the guard instead of leaving the slot in progress with no owner. The slot is *not* silently made reusable,
   because the dead request may already have performed side effects: the sequence
   id stays consumed, an identical retry replays the fault rather than executing
   again, and a different request on that slot still gets
@@ -90,3 +99,7 @@ The slot table, not the worker pool, decides what may execute:
 `tests/forechannel_concurrency.rs` covers slot scheduling, the control lane, the
 concurrency bound, replay across disconnects and worker faults, and record
 framing under inverted completion order.
+
+`src/server/transport/tests.rs` covers the two failure points a socket cannot
+express exactly: cancelling `finish` while it waits for the state lock, and a
+write failure observed while a further record is already readable.

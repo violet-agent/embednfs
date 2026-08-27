@@ -16,6 +16,7 @@
 use std::sync::Arc;
 
 use bytes::Bytes;
+use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
 use tokio::sync::{Semaphore, mpsc};
 use tracing::warn;
@@ -28,6 +29,9 @@ mod dispatch;
 mod record;
 mod replay;
 
+#[cfg(test)]
+mod tests;
+
 use dispatch::ControlGate;
 use record::{RecordReader, response_writer};
 
@@ -38,16 +42,36 @@ impl<F: FileSystem> NfsServer<F> {
         self: &std::sync::Arc<Self>,
         stream: TcpStream,
     ) -> std::io::Result<()> {
+        let (read_half, write_half) = stream.into_split();
+        self.serve_halves(read_half, write_half).await
+    }
+
+    /// Runs the reader/worker/writer trio over one already split byte stream.
+    ///
+    /// A TCP connection is the only production caller; keeping the loop generic
+    /// over the two halves also lets it be driven over in-memory streams whose
+    /// failure points are exact.
+    async fn serve_halves<R, W>(
+        self: &std::sync::Arc<Self>,
+        read_half: R,
+        write_half: W,
+    ) -> std::io::Result<()>
+    where
+        R: AsyncRead + Unpin,
+        W: AsyncWrite + Unpin + Send + 'static,
+    {
         let connection_id = self.state.alloc_connection_id();
         let limit = self.max_concurrent_requests;
-        let (read_half, write_half) = stream.into_split();
 
         let (responses_tx, responses_rx) = mpsc::channel::<Bytes>(limit);
-        let writer = tokio::spawn(response_writer(write_half, responses_rx));
+        let mut writer = tokio::spawn(response_writer(write_half, responses_rx));
 
         let capacity = Arc::new(Semaphore::new(limit));
         let control = Arc::new(ControlGate::new());
         let mut reader = RecordReader::new(read_half);
+        // Set when the writer is what ended the loop, so it is not awaited
+        // twice below.
+        let mut writer_result = None;
 
         let read_result = loop {
             // Capacity is taken *before* the next record is read so that a
@@ -60,10 +84,24 @@ impl<F: FileSystem> NfsServer<F> {
                 break Ok(());
             };
 
-            let record = match reader.read_record().await {
-                Ok(Some(record)) => record,
-                Ok(None) => break Ok(()),
-                Err(e) => break Err(e),
+            let record = tokio::select! {
+                biased;
+                // The writer is watched while the next record is being read.
+                // Once the write half is broken every further reply is
+                // undeliverable, so the connection stops here instead of
+                // executing requests — and committing their side effects —
+                // that the client can never be told the outcome of. Abandoning
+                // the half-read record is safe precisely because this path
+                // tears the connection down.
+                result = &mut writer => {
+                    writer_result = Some(result);
+                    break Ok(());
+                }
+                record = reader.read_record() => match record {
+                    Ok(Some(record)) => record,
+                    Ok(None) => break Ok(()),
+                    Err(e) => break Err(e),
+                },
             };
 
             let Some((call, body)) = Self::decode_rpc_call(record) else {
@@ -87,11 +125,23 @@ impl<F: FileSystem> NfsServer<F> {
         };
 
         // Dropping the reader's sender lets the writer finish once every worker
-        // has dropped its clone, so this also waits for dispatched requests to
-        // complete execution and finalize their replay entries before the
-        // connection task exits.
+        // has dropped its clone.
         std::mem::drop(responses_tx);
-        let write_result = match writer.await {
+
+        // A worker holds its capacity permit until its reply has been
+        // published, so reclaiming the whole capacity waits for every already
+        // dispatched request to finish executing and finalize its replay cache
+        // entry. Unlike awaiting the writer, this still holds when the writer
+        // is the part that died and no longer drains replies.
+        let permits = u32::try_from(limit).unwrap_or(u32::MAX);
+        let _drained = capacity.acquire_many(permits).await;
+
+        // A writer that already ended the loop must not be awaited again.
+        let writer_result = match writer_result {
+            Some(result) => result,
+            None => writer.await,
+        };
+        let write_result = match writer_result {
             Ok(result) => result,
             Err(e) => {
                 warn!("Response writer task failed: {e}");

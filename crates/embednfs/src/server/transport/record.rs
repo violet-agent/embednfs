@@ -5,8 +5,7 @@
 //! several workers complete out of order.
 
 use bytes::{Bytes, BytesMut};
-use tokio::io::{AsyncReadExt, AsyncWrite, AsyncWriteExt, BufWriter};
-use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufWriter};
 use tokio::sync::mpsc;
 use tracing::warn;
 
@@ -15,12 +14,12 @@ use crate::server::{
 };
 
 /// Reassembles inbound RPC records from the read half of a connection.
-pub(super) struct RecordReader {
-    reader: OwnedReadHalf,
+pub(super) struct RecordReader<R> {
+    reader: R,
 }
 
-impl RecordReader {
-    pub(super) fn new(reader: OwnedReadHalf) -> Self {
+impl<R: AsyncRead + Unpin> RecordReader<R> {
+    pub(super) fn new(reader: R) -> Self {
         Self { reader }
     }
 
@@ -29,6 +28,10 @@ impl RecordReader {
     /// Returns `Ok(None)` when the peer closed the connection cleanly or the
     /// record violates the framing limits, in which case the connection must be
     /// torn down without a reply.
+    ///
+    /// Not cancellation-safe: a dropped call loses the fragments it had already
+    /// reassembled, so the caller may only abandon it when it is tearing the
+    /// connection down.
     #[expect(
         clippy::indexing_slicing,
         reason = "fragment lengths are validated against MAX_FRAGMENT_SIZE before slicing"
@@ -81,8 +84,8 @@ impl RecordReader {
 /// Workers publish complete replies through `responses`; this task fragments
 /// them one record at a time, so fragments of different replies never
 /// interleave regardless of completion order.
-pub(super) async fn response_writer(
-    write_half: OwnedWriteHalf,
+pub(super) async fn response_writer<W: AsyncWrite + Unpin>(
+    write_half: W,
     mut responses: mpsc::Receiver<Bytes>,
 ) -> std::io::Result<()> {
     let mut writer = BufWriter::with_capacity(CONN_BUF_SIZE, write_half);

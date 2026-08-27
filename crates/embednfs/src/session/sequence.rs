@@ -17,6 +17,17 @@ pub(crate) enum TryFinishSequence {
 }
 
 impl StateManager {
+    /// Takes the state write lock and hands the guard to the caller.
+    ///
+    /// Only cancellation tests need this: parking a task on the state lock at a
+    /// chosen moment is the one way to interrupt `finish_sequence` exactly
+    /// where a cancelled worker would be. The guard is opaque so the lock's
+    /// interior stays private.
+    #[cfg(test)]
+    pub(crate) async fn lock_state_for_test(&self) -> impl Send {
+        self.inner.write().await
+    }
+
     fn sequence_res(
         session: &SessionState,
         args: &SequenceArgs4,
@@ -134,13 +145,31 @@ impl StateManager {
 
     /// Complete a forechannel request and store the encoded Compound4Res body
     /// for future retries on the same slot/sequence.
+    ///
+    /// The token is borrowed rather than consumed because this call must be
+    /// cancellation-safe: awaiting the state lock is its only cancellation
+    /// point, and `token` is still `Some` if the future is dropped there, so
+    /// the caller keeps ownership of the slot and can install a fallback reply.
+    /// A slot that could not be finalized hands the token back for the same
+    /// reason.
     pub(crate) async fn finish_sequence(
         &self,
-        token: SequenceCacheToken,
+        token: &mut Option<SequenceCacheToken>,
         response: Vec<u8>,
     ) -> Result<(), NfsStat4> {
         let mut inner = self.inner.write().await;
-        Self::finish_sequence_locked(&mut inner, token, response)
+        // Everything below runs to completion without awaiting, so the slot
+        // cannot be left half-finalized once the token has been taken.
+        let Some(taken) = token.take() else {
+            return Ok(());
+        };
+        match Self::finish_sequence_locked(&mut inner, taken, response) {
+            Ok(()) => Ok(()),
+            Err((status, taken)) => {
+                *token = Some(taken);
+                Err(status)
+            }
+        }
     }
 
     /// Complete a forechannel request without awaiting the state lock.
@@ -158,23 +187,26 @@ impl StateManager {
         match self.inner.try_write() {
             Ok(mut inner) => match Self::finish_sequence_locked(&mut inner, token, response) {
                 Ok(()) => TryFinishSequence::Finished,
-                Err(status) => TryFinishSequence::Failed(status),
+                Err((status, _token)) => TryFinishSequence::Failed(status),
             },
             Err(_) => TryFinishSequence::Contended(token, response),
         }
     }
 
+    /// Stores the reply, or hands the token back with the status that stopped
+    /// it so the caller can decide on a fallback.
     fn finish_sequence_locked(
         inner: &mut StateInner,
         token: SequenceCacheToken,
         response: Vec<u8>,
-    ) -> Result<(), NfsStat4> {
-        let session = inner
-            .sessions
-            .get_mut(&token.sessionid)
-            .ok_or(NfsStat4::BadSession)?;
+    ) -> Result<(), (NfsStat4, SequenceCacheToken)> {
+        let Some(session) = inner.sessions.get_mut(&token.sessionid) else {
+            return Err((NfsStat4::BadSession, token));
+        };
         let slot_idx = token.slotid as usize;
-        let slot = session.slots.get_mut(slot_idx).ok_or(NfsStat4::BadSlot)?;
+        let Some(slot) = session.slots.get_mut(slot_idx) else {
+            return Err((NfsStat4::BadSlot, token));
+        };
 
         slot.in_progress = None;
         slot.cached_reply = Some(CachedReplay {

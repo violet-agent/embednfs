@@ -45,11 +45,17 @@ impl SequenceFinalizer {
     ///
     /// Must be called before the reply is published to the response writer so
     /// that a retry never races ahead of the replay cache entry.
+    ///
+    /// The token stays owned by `self` across the await, so this is
+    /// cancellation-safe: a worker cancelled while waiting for the state lock,
+    /// or one whose finalization fails, still runs `Drop` below and leaves the
+    /// slot with a replayable fault instead of stuck in progress. `Drop` is a
+    /// no-op once the real reply has been cached.
     pub(super) async fn finish(mut self, body: Vec<u8>) {
-        let Some(token) = self.token.take() else {
+        if self.token.is_none() {
             return;
-        };
-        if let Err(status) = self.state.finish_sequence(token, body).await {
+        }
+        if let Err(status) = self.state.finish_sequence(&mut self.token, body).await {
             warn!("Failed to finalize replay cache entry: {status:?}");
         }
     }
@@ -67,7 +73,7 @@ impl Drop for SequenceFinalizer {
             return;
         };
         warn!(
-            "Forechannel worker dropped after prepare_sequence (slot {}); caching a replayable SERVERFAULT reply",
+            "Forechannel slot {} left in progress without a reply; caching a replayable SERVERFAULT",
             token.slotid
         );
 
@@ -86,7 +92,8 @@ impl Drop for SequenceFinalizer {
         // finalization to the runtime instead.
         match tokio::runtime::Handle::try_current() {
             Ok(handle) => std::mem::drop(handle.spawn(async move {
-                if let Err(status) = state.finish_sequence(token, body).await {
+                let mut token = Some(token);
+                if let Err(status) = state.finish_sequence(&mut token, body).await {
                     warn!("Failed to finalize faulted replay cache entry: {status:?}");
                 }
             })),
