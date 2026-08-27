@@ -6,7 +6,7 @@
 
 use bytes::{Bytes, BytesMut};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufWriter};
-use tokio::sync::mpsc;
+use tokio::sync::{OwnedSemaphorePermit, mpsc};
 use tracing::warn;
 
 use crate::server::{
@@ -79,6 +79,26 @@ impl<R: AsyncRead + Unpin> RecordReader<R> {
     }
 }
 
+/// A finished reply on its way to the writer, carrying the connection capacity
+/// permit that admitted the record it answers.
+///
+/// One permit covers a request's entire lifecycle — reading its record,
+/// executing it, and holding its encoded reply until the socket has taken it —
+/// so a connection never holds more than `max_concurrent_requests` request and
+/// reply bodies together. Dropping this value is what returns the permit, which
+/// also means a discarded queue (a dead writer, a dead connection) can never
+/// leak capacity.
+pub(super) struct QueuedResponse {
+    body: Bytes,
+    permit: OwnedSemaphorePermit,
+}
+
+impl QueuedResponse {
+    pub(super) fn new(body: Bytes, permit: OwnedSemaphorePermit) -> Self {
+        Self { body, permit }
+    }
+}
+
 /// Owns the write half and serializes every encoded reply onto the wire.
 ///
 /// Workers publish complete replies through `responses`; this task fragments
@@ -86,16 +106,26 @@ impl<R: AsyncRead + Unpin> RecordReader<R> {
 /// interleave regardless of completion order.
 pub(super) async fn response_writer<W: AsyncWrite + Unpin>(
     write_half: W,
-    mut responses: mpsc::Receiver<Bytes>,
+    mut responses: mpsc::Receiver<QueuedResponse>,
 ) -> std::io::Result<()> {
     let mut writer = BufWriter::with_capacity(CONN_BUF_SIZE, write_half);
+    // Capacity permits of replies that are encoded into the buffer but not yet
+    // on the socket. There are only `max_concurrent_requests` permits in
+    // existence, so this holds at most that many.
+    let mut buffered = Vec::new();
 
     while let Some(response) = responses.recv().await {
-        write_record(&mut writer, response).await?;
+        let QueuedResponse { body, permit } = response;
+        write_record(&mut writer, body).await?;
+        buffered.push(permit);
         // Coalesce syscalls when several workers finish together, but never
-        // leave a completed reply sitting in the buffer.
+        // leave a completed reply sitting in the buffer. Emptying the queue is
+        // also what returns capacity, and it always happens: once every permit
+        // is buffered here no worker can be running, so no further reply can be
+        // queued and this branch is taken.
         if responses.is_empty() {
             writer.flush().await?;
+            buffered.clear();
         }
     }
 

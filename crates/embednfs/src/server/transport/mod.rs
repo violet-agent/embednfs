@@ -15,7 +15,6 @@
 
 use std::sync::Arc;
 
-use bytes::Bytes;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
 use tokio::sync::{Semaphore, mpsc};
@@ -33,7 +32,7 @@ mod replay;
 mod tests;
 
 use dispatch::ControlGate;
-use record::{RecordReader, response_writer};
+use record::{QueuedResponse, RecordReader, response_writer};
 
 impl<F: FileSystem> NfsServer<F> {
     /// Serves one accepted TCP connection until the peer disconnects or the
@@ -63,7 +62,7 @@ impl<F: FileSystem> NfsServer<F> {
         let connection_id = self.state.alloc_connection_id();
         let limit = self.max_concurrent_requests;
 
-        let (responses_tx, responses_rx) = mpsc::channel::<Bytes>(limit);
+        let (responses_tx, responses_rx) = mpsc::channel::<QueuedResponse>(limit);
         let mut writer = tokio::spawn(response_writer(write_half, responses_rx));
 
         let capacity = Arc::new(Semaphore::new(limit));
@@ -77,9 +76,9 @@ impl<F: FileSystem> NfsServer<F> {
             // Capacity is taken *before* the next record is read so that a
             // connection can never accumulate unbounded request bodies: an
             // unread record stays in the socket receive buffer and TCP flow
-            // control pushes back on the client. The permit is handed to the
-            // worker and released only once its response has been published,
-            // which bounds queued response bodies the same way.
+            // control pushes back on the client. The permit then follows the
+            // request all the way to the writer, so the same budget bounds
+            // request bodies, running workers, and queued replies together.
             let Ok(permit) = Arc::clone(&capacity).acquire_owned().await else {
                 break Ok(());
             };
@@ -112,15 +111,17 @@ impl<F: FileSystem> NfsServer<F> {
             let responses = responses_tx.clone();
             let control = Arc::clone(&control);
             std::mem::drop(tokio::spawn(async move {
-                let _permit = permit;
                 let response = server
                     .process_rpc_call(call, body, connection_id, &control)
                     .await;
-                // A send failure means the peer is gone or the writer failed.
-                // The worker has already finalized its replay cache entry at
-                // this point, so dropping the encoded reply is safe: the client
-                // gets it from the slot's replay cache when it retries.
-                let _ = responses.send(response).await;
+                // The permit rides along with the reply and is released by the
+                // writer, never by the queue insert. A send failure means the
+                // peer is gone or the writer failed; the worker has already
+                // finalized its replay cache entry at this point, so dropping
+                // the encoded reply — and with it the permit — is safe: the
+                // client gets the reply from the slot's replay cache when it
+                // retries.
+                let _ = responses.send(QueuedResponse::new(response, permit)).await;
             }));
         };
 
@@ -128,11 +129,12 @@ impl<F: FileSystem> NfsServer<F> {
         // has dropped its clone.
         std::mem::drop(responses_tx);
 
-        // A worker holds its capacity permit until its reply has been
-        // published, so reclaiming the whole capacity waits for every already
-        // dispatched request to finish executing and finalize its replay cache
-        // entry. Unlike awaiting the writer, this still holds when the writer
-        // is the part that died and no longer drains replies.
+        // Every permit is held by a running worker, by a queued reply, or by a
+        // reply the writer has buffered, so reclaiming the whole capacity waits
+        // for every already dispatched request to finish executing and finalize
+        // its replay cache entry. Unlike awaiting the writer, this still holds
+        // when the writer is the part that died: it drops the receiver, which
+        // drops the queued replies and returns their permits.
         let permits = u32::try_from(limit).unwrap_or(u32::MAX);
         let _drained = capacity.acquire_many(permits).await;
 

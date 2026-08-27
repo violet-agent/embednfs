@@ -6,7 +6,10 @@ use tokio::time::timeout;
 
 use embednfs_proto::{NfsStat4, OP_EXCHANGE_ID};
 
-use super::{NOT_YET_WINDOW, assert_getattr_ok, assert_sequence_error, getattr_compound};
+use super::{
+    NOT_YET_WINDOW, assert_destroy_session_ok, assert_getattr_ok, assert_sequence_error,
+    getattr_compound,
+};
 use crate::common::*;
 
 const SLOW_GETATTR: Duration = Duration::from_secs(5);
@@ -272,4 +275,76 @@ async fn test_control_compound_is_exclusive_with_slot_workers() {
     let (opnum, op_status) = parse_op_header(&mut control_resp);
     assert_eq!(opnum, OP_EXCHANGE_ID);
     assert_eq!(op_status, NfsStat4::Ok as u32);
+}
+
+/// A COMPOUND that opens with a valid SEQUENCE but ends in DESTROY_SESSION is
+/// still a control request: it waits for the in-flight slot worker instead of
+/// destroying the session out from under it. The session is therefore still
+/// alive while that worker executes, so the worker's slot finalization cannot
+/// fail with `NFS4ERR_BADSESSION` and lose its executed reply.
+/// Origin: lane-selection review of the concurrent forechannel loop; a leading SEQUENCE alone does not make a COMPOUND safe to run beside other slots.
+/// RFC: RFC 8881 §18.37.3 (DESTROY_SESSION as the final operation of a sequenced COMPOUND), §2.10.6.1.3.
+#[tokio::test]
+async fn test_sequenced_destroy_session_is_exclusive_with_slot_workers() {
+    let (fs, gate) = gated_fs(&[("block.txt", 0)], &["block.txt"], &[]).await;
+    let port = start_server_with_fs(fs).await;
+    let mut stream = connect(port).await;
+    let sessionid = setup_session(&mut stream).await;
+
+    let blocked = getattr_compound("destroy-slot", &sessionid, 1, 0, "block.txt");
+    write_rpc_record(&mut stream, 3, 1, &blocked).await;
+    // Deterministic: the backend is inside the blocked GETATTR.
+    gate.wait_entered(1).await;
+
+    let seq_op = encode_sequence(&sessionid, 1, 1);
+    let destroy_op = encode_destroy_session(&sessionid);
+    let destroy = encode_compound("sequenced-destroy", &[&seq_op, &destroy_op]);
+    write_rpc_record(&mut stream, 4, 1, &destroy).await;
+    let replied_early = timeout(NOT_YET_WINDOW, read_rpc_record(&mut stream)).await;
+
+    // A second connection observes the session from outside the gate: SEQUENCE
+    // succeeds, so the session still exists even though DESTROY_SESSION has
+    // been sitting on the connection for a whole `NOT_YET_WINDOW`.
+    let mut probe = connect(port).await;
+    let probe_compound = encode_compound("probe", &[&encode_sequence(&sessionid, 1, 2)]);
+    let mut probe_resp = send_rpc(&mut probe, 10, 1, &probe_compound).await;
+    let (_, accept_stat) = parse_rpc_reply_fields(&mut probe_resp);
+    assert_eq!(accept_stat, 0);
+    let (status, _, _) = parse_compound_header(&mut probe_resp);
+    assert_eq!(
+        status,
+        NfsStat4::Ok as u32,
+        "the session must outlive every slot worker that is still executing"
+    );
+
+    assert!(
+        replied_early.is_err(),
+        "SEQUENCE; DESTROY_SESSION must not execute while a slot worker holds the shared lane"
+    );
+
+    gate.release();
+
+    // Both replies land once the worker drains. They are correlated by XID
+    // because the writer publishes them in completion order, not send order.
+    let mut seen_slot = false;
+    let mut seen_destroy = false;
+    for _ in 0..2 {
+        let (mut resp, _) = timeout(NOT_YET_WINDOW * 20, read_rpc_record(&mut stream))
+            .await
+            .expect("both replies arrive once the blocked slot worker drains");
+        let (xid, _) = parse_rpc_reply_fields(&mut resp.clone());
+        match xid {
+            3 => {
+                assert_eq!(assert_getattr_ok(&mut resp), 3);
+                seen_slot = true;
+            }
+            4 => {
+                assert_eq!(assert_destroy_session_ok(&mut resp), 4);
+                seen_destroy = true;
+            }
+            other => panic!("unexpected reply xid {other}"),
+        }
+    }
+    assert!(seen_slot, "the blocked slot request completed");
+    assert!(seen_destroy, "the sequenced DESTROY_SESSION completed");
 }

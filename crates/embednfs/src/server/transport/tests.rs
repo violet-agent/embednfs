@@ -1,10 +1,10 @@
 //! Unit tests for the connection loop and its slot finalization.
 //!
-//! These live inside the crate because both cases need a failure point a real
+//! These live inside the crate because each case needs a failure point a real
 //! socket cannot express: one parks a task on the state manager's write lock,
-//! the other breaks the write half while the read half keeps delivering.
-//! Everything socket-observable is covered by
-//! `tests/forechannel_concurrency.rs` instead.
+//! one breaks the write half while the read half keeps delivering, and one
+//! freezes the write half without ever failing it. Everything socket-observable
+//! is covered by `tests/forechannel_concurrency.rs` instead.
 #![allow(
     clippy::unwrap_used,
     clippy::expect_used,
@@ -14,9 +14,10 @@
 
 use std::io;
 use std::pin::Pin;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::task::{Context, Poll};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
+use std::task::{Context, Poll, Waker};
+use std::time::Duration;
 
 use bytes::{BufMut, Bytes, BytesMut};
 use tokio::io::AsyncWrite;
@@ -214,6 +215,79 @@ impl AsyncWrite for FailingWriter {
     }
 }
 
+/// Release switch for [`BlockedWriter`], shared with the test.
+struct WriterGate {
+    released: AtomicBool,
+    /// Only the response writer task ever parks here, so one slot is enough.
+    waker: Mutex<Option<Waker>>,
+    written: AtomicUsize,
+}
+
+impl WriterGate {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            released: AtomicBool::new(false),
+            waker: Mutex::new(None),
+            written: AtomicUsize::new(0),
+        })
+    }
+
+    /// Lets the write half accept bytes, and wakes a writer parked on it.
+    fn release(&self) {
+        self.released.store(true, Ordering::SeqCst);
+        let waker = self.waker.lock().unwrap().take();
+        if let Some(waker) = waker {
+            waker.wake();
+        }
+    }
+
+    /// Bytes the write half has accepted since it was released.
+    fn written(&self) -> usize {
+        self.written.load(Ordering::SeqCst)
+    }
+
+    fn poll_released(&self, cx: &Context<'_>) -> Poll<()> {
+        if self.released.load(Ordering::SeqCst) {
+            return Poll::Ready(());
+        }
+        *self.waker.lock().unwrap() = Some(cx.waker().clone());
+        // Re-check after registering, so a release that raced the registration
+        // cannot be missed.
+        if self.released.load(Ordering::SeqCst) {
+            Poll::Ready(())
+        } else {
+            Poll::Pending
+        }
+    }
+}
+
+/// Write half that never accepts a byte until the test releases it and never
+/// fails, which is what a peer that stops reading looks like to the server.
+struct BlockedWriter {
+    gate: Arc<WriterGate>,
+}
+
+impl AsyncWrite for BlockedWriter {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        self.gate.poll_released(cx).map(|()| {
+            let _ = self.gate.written.fetch_add(buf.len(), Ordering::SeqCst);
+            Ok(buf.len())
+        })
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        self.gate.poll_released(cx).map(Ok)
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        self.gate.poll_released(cx).map(Ok)
+    }
+}
+
 /// Creates a confirmed client and session straight in the state manager, which
 /// is all these tests need from the EXCHANGE_ID/CREATE_SESSION handshake.
 async fn new_session(state: &StateManager) -> Sessionid4 {
@@ -366,6 +440,81 @@ async fn test_finish_cancelled_on_the_state_lock_leaves_a_replayable_fault() {
         }
         _ => panic!("expected the slot to be replayable"),
     }
+}
+
+/// A peer that stops reading cannot make one connection hold more than
+/// `max_concurrent_requests` requests at once. The capacity permit is returned
+/// by the writer, not by a successful queue insert, so queued replies and
+/// running workers draw on one budget instead of two; the workload still
+/// completes in full once the peer resumes.
+/// Origin: capacity-budget review of the response queue (a permit released on `send` let `limit` queued replies coexist with `limit` workers holding complete bodies).
+/// RFC: RFC 8881 §2.10.6.1 (the slot table bounds outstanding requests), RFC 5531 §11.
+#[tokio::test]
+async fn test_a_blocked_writer_bounds_the_connection_to_its_capacity_budget() {
+    const LIMIT: usize = 2;
+    const REQUESTS: u32 = 8;
+
+    let (fs, getattr_calls) = ProbeFs::new();
+    let server = Arc::new(
+        NfsServer::builder(fs)
+            .max_concurrent_requests(LIMIT)
+            .build(),
+    );
+    let sessionid = new_session(&server.state).await;
+
+    let (mut client, read_half) = tokio::io::duplex(64 * 1024);
+    let gate = WriterGate::new();
+    let write_half = BlockedWriter {
+        gate: Arc::clone(&gate),
+    };
+
+    let connection = {
+        let server = Arc::clone(&server);
+        tokio::spawn(async move { server.serve_halves(read_half, write_half).await })
+    };
+
+    // Every record is delivered up front: the duplex buffer holds all of them,
+    // so nothing below is waiting on the client.
+    for slot in 0..REQUESTS {
+        let compound = getattr_compound("budget", &sessionid, 1, slot);
+        tokio::io::AsyncWriteExt::write_all(&mut client, &rpc_record(100 + slot, &compound))
+            .await
+            .unwrap();
+    }
+
+    // Nothing in the connection is waiting on time, so letting every runnable
+    // task run is enough to reach the steady state; the sleep only covers task
+    // spawns the yields could have missed.
+    for _ in 0..64 {
+        tokio::task::yield_now().await;
+    }
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    assert_eq!(
+        gate.written(),
+        0,
+        "the blocked write half must not have taken any reply"
+    );
+    assert_eq!(
+        getattr_calls.load(Ordering::SeqCst),
+        LIMIT,
+        "a connection whose replies cannot drain must not execute past its capacity budget"
+    );
+
+    // Releasing the peer drains the queue, and the whole pipeline completes.
+    gate.release();
+    std::mem::drop(client);
+    connection
+        .await
+        .unwrap()
+        .expect("the connection closes cleanly once the peer resumes reading");
+
+    assert_eq!(
+        getattr_calls.load(Ordering::SeqCst),
+        REQUESTS as usize,
+        "every pipelined request runs once the budget is released"
+    );
+    assert!(gate.written() > 0, "the replies reached the write half");
 }
 
 /// Once a response write fails, the connection stops dispatching records: a

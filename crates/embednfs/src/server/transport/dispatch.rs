@@ -19,13 +19,16 @@ use crate::server::{
 
 /// Serializes control traffic against forechannel traffic on one connection.
 ///
-/// COMPOUNDs that start with a valid SEQUENCE take the gate in shared mode and
-/// therefore run concurrently with each other; session and other unsequenced
-/// control COMPOUNDs (EXCHANGE_ID, CREATE_SESSION, DESTROY_SESSION,
-/// DESTROY_CLIENTID, BIND_CONN_TO_SESSION, and rejected unsequenced requests)
-/// take it exclusively. Session creation and destruction therefore keep the
-/// conservative "nothing else is running" behavior they had when requests were
-/// executed one at a time.
+/// Ordinary forechannel COMPOUNDs take the gate in shared mode and therefore
+/// run concurrently with each other; every COMPOUND that touches client or
+/// session lifetime takes it exclusively. Session creation and destruction
+/// therefore keep the conservative "nothing else is running" behavior they had
+/// when requests were executed one at a time.
+///
+/// The lane follows from the whole operation array, not just its first
+/// operation: `SEQUENCE; DESTROY_SESSION` is a legal sequenced COMPOUND
+/// (RFC 8881 §18.37.3) that must not run beside other slots of the session it
+/// is about to destroy.
 pub(super) struct ControlGate {
     /// A shared holder takes one permit; an exclusive holder takes them all.
     /// `tokio`'s semaphore is FIFO-fair, so a waiting exclusive holder is not
@@ -55,6 +58,36 @@ impl ControlGate {
         };
         self.permits.acquire_many(wanted).await.ok()
     }
+}
+
+/// Whether `op` changes which clients, sessions, or connection bindings exist.
+///
+/// Such an operation invalidates state that concurrent workers on the same
+/// connection are executing against — most visibly, DESTROY_SESSION can remove
+/// the session a running worker is about to finalize its slot in, which turns
+/// that finalization into an NFS4ERR_BADSESSION failure and loses the executed
+/// reply. They therefore run alone on the connection.
+fn is_lifecycle_op(op: &NfsArgop4) -> bool {
+    matches!(
+        op,
+        NfsArgop4::ExchangeId(_)
+            | NfsArgop4::CreateSession(_)
+            | NfsArgop4::DestroySession(_)
+            | NfsArgop4::DestroyClientid(_)
+            | NfsArgop4::BindConnToSession(_)
+    )
+}
+
+/// Whether `args` may execute in the shared lane beside other slot workers.
+///
+/// A leading SEQUENCE alone is not enough: the COMPOUND must also be free of
+/// lifecycle operations. Anything else — including a COMPOUND this server is
+/// about to reject for its minor version or its missing SEQUENCE — takes the
+/// lane exclusively.
+fn takes_shared_lane(args: &Compound4Args) -> bool {
+    args.minorversion == 1
+        && matches!(args.argarray.first(), Some(NfsArgop4::Sequence(_)))
+        && !args.argarray.iter().any(is_lifecycle_op)
 }
 
 #[expect(
@@ -166,7 +199,7 @@ impl<F: FileSystem> NfsServer<F> {
         // Held for the whole request; see `ControlGate`. Failing to take the
         // lane is fail-closed: the request is answered with a status that says
         // nothing ran, before any session or filesystem work happens.
-        let Some(_lane) = control.acquire(leading_sequence).await else {
+        let Some(_lane) = control.acquire(takes_shared_lane(&args)).await else {
             warn!("Control gate closed; rejecting COMPOUND without executing it");
             let result = if leading_sequence {
                 sequence_error_compound(&args.tag, NfsStat4::Serverfault)

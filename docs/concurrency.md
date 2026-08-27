@@ -24,10 +24,14 @@ Consequences:
   replies were produced concurrently.
 * **Replies may be reordered.** A reply is written when its worker finishes.
   Clients correlate by RPC XID, as RFC 5531 requires.
-* **Nothing is unbounded.** Execution capacity is acquired *before* the next
-  record is read, so a connection holds at most `max_concurrent_requests`
-  request bodies and the same number of response bodies. Unread records stay in
-  the socket receive buffer and TCP flow control pushes back on the client.
+* **Nothing is unbounded.** One capacity permit covers a request's whole
+  lifecycle: it is acquired *before* the next record is read, travels with the
+  encoded reply through the response queue, and is returned only once the writer
+  has flushed that reply to the socket. Running workers and queued replies
+  therefore draw on a single budget, and a connection holds at most
+  `max_concurrent_requests` bodies in total — a peer that stops reading cannot
+  make it hold two budgets' worth. Unread records stay in the socket receive
+  buffer and TCP flow control pushes back on the client.
   The default limit is `DEFAULT_MAX_CONCURRENT_REQUESTS` (64), which equals the
   advertised forechannel slot count (`fore_chan_attrs.maxrequests`), so a
   conforming client is never throttled below its own slot table.
@@ -36,13 +40,20 @@ Consequences:
 
 ## Lanes
 
-Requests take a per-connection gate before executing:
+Requests take a per-connection gate before executing. The lane follows from the
+**whole** operation array, not just its first operation:
 
-* a COMPOUND whose first operation is SEQUENCE (minorversion 1) takes the gate
-  **shared**, so different slots run concurrently;
-* every other COMPOUND — EXCHANGE_ID, CREATE_SESSION, DESTROY_SESSION,
-  DESTROY_CLIENTID, BIND_CONN_TO_SESSION, and unsequenced requests that are
-  about to be rejected — takes it **exclusively**.
+* a minorversion-1 COMPOUND that starts with SEQUENCE and contains no lifecycle
+  operation takes the gate **shared**, so different slots run concurrently;
+* every other COMPOUND takes it **exclusively**. That covers unsequenced
+  control requests (EXCHANGE_ID, CREATE_SESSION, DESTROY_SESSION,
+  DESTROY_CLIENTID, BIND_CONN_TO_SESSION), requests that are about to be
+  rejected for their minor version or missing SEQUENCE, *and* sequenced
+  COMPOUNDs that carry a lifecycle operation — `SEQUENCE; DESTROY_SESSION` is a
+  legal forechannel request (RFC 8881 §18.37.3), and running it beside other
+  slots would let it destroy the session a live worker is about to finalize its
+  slot in, turning that finalization into an NFS4ERR_BADSESSION failure that
+  loses the executed reply.
 
 Session creation and destruction therefore keep the conservative "nothing else
 is running on this connection" behavior they had when requests were handled one
@@ -100,6 +111,7 @@ The slot table, not the worker pool, decides what may execute:
 concurrency bound, replay across disconnects and worker faults, and record
 framing under inverted completion order.
 
-`src/server/transport/tests.rs` covers the two failure points a socket cannot
-express exactly: cancelling `finish` while it waits for the state lock, and a
-write failure observed while a further record is already readable.
+`src/server/transport/tests.rs` covers the failure points a socket cannot
+express exactly: cancelling `finish` while it waits for the state lock, a write
+failure observed while a further record is already readable, and a write half
+that freezes without ever failing, which pins the capacity budget in place.
