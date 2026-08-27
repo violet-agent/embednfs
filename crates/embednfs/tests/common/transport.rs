@@ -34,6 +34,18 @@ pub async fn send_rpc_record_with_auth(
     cred: &OpaqueAuth,
     verf: &OpaqueAuth,
 ) -> (Bytes, usize) {
+    write_rpc_record_with_auth(stream, xid, proc_num, payload, cred, verf).await;
+    read_rpc_record(stream).await
+}
+
+/// Encodes an RPC call message body (without the record fragment header).
+pub fn encode_rpc_call(
+    xid: u32,
+    proc_num: u32,
+    payload: &[u8],
+    cred: &OpaqueAuth,
+    verf: &OpaqueAuth,
+) -> Bytes {
     let mut msg = BytesMut::with_capacity(256);
     xid.encode(&mut msg);
     0u32.encode(&mut msg);
@@ -44,12 +56,40 @@ pub async fn send_rpc_record_with_auth(
     cred.encode(&mut msg);
     verf.encode(&mut msg);
     msg.put_slice(payload);
+    msg.freeze()
+}
 
+/// Sends one complete RPC record without waiting for its reply, so that tests
+/// can pipeline several requests on one connection.
+pub async fn write_rpc_record(stream: &mut TcpStream, xid: u32, proc_num: u32, payload: &[u8]) {
+    write_rpc_record_with_auth(
+        stream,
+        xid,
+        proc_num,
+        payload,
+        &OpaqueAuth::null(),
+        &OpaqueAuth::null(),
+    )
+    .await;
+}
+
+pub async fn write_rpc_record_with_auth(
+    stream: &mut TcpStream,
+    xid: u32,
+    proc_num: u32,
+    payload: &[u8],
+    cred: &OpaqueAuth,
+    verf: &OpaqueAuth,
+) {
+    let msg = encode_rpc_call(xid, proc_num, payload, cred, verf);
     let len = msg.len() as u32 | 0x8000_0000;
     stream.write_all(&len.to_be_bytes()).await.unwrap();
     stream.write_all(&msg).await.unwrap();
     stream.flush().await.unwrap();
+}
 
+/// Reads one complete RPC record and returns it with its fragment count.
+pub async fn read_rpc_record(stream: &mut TcpStream) -> (Bytes, usize) {
     let mut resp = BytesMut::new();
     let mut fragment_count = 0usize;
     loop {

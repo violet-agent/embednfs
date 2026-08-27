@@ -18,4 +18,7 @@ pub use fs::{
     SetTime, Symlinks, Timestamp, WriteResult, WriteStability, XattrSetMode, Xattrs,
 };
 pub use memfs::MemFs;
-pub use server::{IdMapper, NfsServer, NfsServerBuilder, NumericIdMapper};
+pub use server::{
+    DEFAULT_MAX_CONCURRENT_REQUESTS, IdMapper, MAX_CONCURRENT_REQUESTS_LIMIT, NfsServer,
+    NfsServerBuilder, NumericIdMapper,
+};

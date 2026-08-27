@@ -1,0 +1,121 @@
+//! RFC 5531 record framing for RPC over TCP.
+//!
+//! The reader and the writer live on opposite halves of the socket and never
+//! touch the other half, which is what keeps outbound records intact when
+//! several workers complete out of order.
+
+use bytes::{Bytes, BytesMut};
+use tokio::io::{AsyncReadExt, AsyncWrite, AsyncWriteExt, BufWriter};
+use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
+use tokio::sync::mpsc;
+use tracing::warn;
+
+use crate::server::{
+    CONN_BUF_SIZE, MAX_FRAGMENT_SIZE, MAX_FRAGMENT_SIZE_U32, RPC_FRAG_LEN_MASK, RPC_LAST_FRAGMENT,
+};
+
+/// Reassembles inbound RPC records from the read half of a connection.
+pub(super) struct RecordReader {
+    reader: OwnedReadHalf,
+}
+
+impl RecordReader {
+    pub(super) fn new(reader: OwnedReadHalf) -> Self {
+        Self { reader }
+    }
+
+    /// Reads one complete RPC record.
+    ///
+    /// Returns `Ok(None)` when the peer closed the connection cleanly or the
+    /// record violates the framing limits, in which case the connection must be
+    /// torn down without a reply.
+    #[expect(
+        clippy::indexing_slicing,
+        reason = "fragment lengths are validated against MAX_FRAGMENT_SIZE before slicing"
+    )]
+    pub(super) async fn read_record(&mut self) -> std::io::Result<Option<Bytes>> {
+        let mut record = BytesMut::with_capacity(CONN_BUF_SIZE);
+
+        loop {
+            let mut header = [0u8; 4];
+            match self.reader.read_exact(&mut header).await {
+                Ok(_) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
+                Err(e) => return Err(e),
+            }
+            let header_val = u32::from_be_bytes(header);
+            let last_fragment = (header_val & RPC_LAST_FRAGMENT) != 0;
+            let frag_len = (header_val & RPC_FRAG_LEN_MASK) as usize;
+
+            if frag_len > MAX_FRAGMENT_SIZE {
+                warn!("Fragment too large: {frag_len}");
+                return Ok(None);
+            }
+
+            let record_len = record.len();
+            let new_len = match record_len.checked_add(frag_len) {
+                Some(len) if len <= MAX_FRAGMENT_SIZE => len,
+                _ => {
+                    warn!(
+                        "RPC record exceeds configured limit: current={}, incoming={}",
+                        record_len, frag_len
+                    );
+                    return Ok(None);
+                }
+            };
+            record.resize(new_len, 0);
+            let _ = self
+                .reader
+                .read_exact(&mut record[record_len..new_len])
+                .await?;
+
+            if last_fragment {
+                return Ok(Some(record.freeze()));
+            }
+        }
+    }
+}
+
+/// Owns the write half and serializes every encoded reply onto the wire.
+///
+/// Workers publish complete replies through `responses`; this task fragments
+/// them one record at a time, so fragments of different replies never
+/// interleave regardless of completion order.
+pub(super) async fn response_writer(
+    write_half: OwnedWriteHalf,
+    mut responses: mpsc::Receiver<Bytes>,
+) -> std::io::Result<()> {
+    let mut writer = BufWriter::with_capacity(CONN_BUF_SIZE, write_half);
+
+    while let Some(response) = responses.recv().await {
+        write_record(&mut writer, response).await?;
+        // Coalesce syscalls when several workers finish together, but never
+        // leave a completed reply sitting in the buffer.
+        if responses.is_empty() {
+            writer.flush().await?;
+        }
+    }
+
+    writer.flush().await
+}
+
+async fn write_record<W: AsyncWrite + Unpin>(
+    writer: &mut W,
+    mut response: Bytes,
+) -> std::io::Result<()> {
+    loop {
+        let fragment = response.split_to(response.len().min(MAX_FRAGMENT_SIZE));
+        let last_fragment = response.is_empty();
+        // The split above bounds the fragment by MAX_FRAGMENT_SIZE, which is
+        // well below the RFC 5531 fragment length field limit.
+        let mut header = u32::try_from(fragment.len()).unwrap_or(MAX_FRAGMENT_SIZE_U32);
+        if last_fragment {
+            header |= RPC_LAST_FRAGMENT;
+        }
+        writer.write_all(&header.to_be_bytes()).await?;
+        writer.write_all(&fragment).await?;
+        if last_fragment {
+            return Ok(());
+        }
+    }
+}

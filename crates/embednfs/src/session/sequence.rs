@@ -2,7 +2,7 @@ use embednfs_proto::{NfsStat4, SequenceArgs4, SequenceRes4};
 
 use super::StateManager;
 use super::model::{
-    CachedReplay, ClientLeaseState, SequenceCacheToken, SequenceReplay, SessionState,
+    CachedReplay, ClientLeaseState, SequenceCacheToken, SequenceReplay, SessionState, StateInner,
 };
 
 impl StateManager {
@@ -67,18 +67,28 @@ impl StateManager {
             let retry_seq = slot.sequence_id.wrapping_sub(1);
 
             if args.sequenceid == slot.sequence_id {
-                slot.sequence_id = slot.sequence_id.wrapping_add(1);
-                slot.in_progress = Some(fingerprint.to_vec());
-                slot.cached_reply = None;
-                let res = Self::sequence_res(session, args, 0);
-                SequenceReplay::Execute(
-                    res,
-                    SequenceCacheToken {
-                        sessionid: args.sessionid,
-                        slotid: args.slotid,
-                        fingerprint: fingerprint.to_vec(),
-                    },
-                )
+                if slot.in_progress.is_some() {
+                    // RFC 8881 §2.10.6.1: a slot carries at most one
+                    // outstanding request. A client that advances the sequence
+                    // id while the previous request on the same slot is still
+                    // executing is violating that rule; answering NFS4ERR_DELAY
+                    // keeps the slot single-threaded instead of running two
+                    // requests concurrently against the same replay entry.
+                    SequenceReplay::Error(NfsStat4::Delay)
+                } else {
+                    slot.sequence_id = slot.sequence_id.wrapping_add(1);
+                    slot.in_progress = Some(fingerprint.to_vec());
+                    slot.cached_reply = None;
+                    let res = Self::sequence_res(session, args, 0);
+                    SequenceReplay::Execute(
+                        res,
+                        SequenceCacheToken {
+                            sessionid: args.sessionid,
+                            slotid: args.slotid,
+                            fingerprint: fingerprint.to_vec(),
+                        },
+                    )
+                }
             } else if args.sequenceid != retry_seq {
                 SequenceReplay::Error(NfsStat4::SeqMisordered)
             } else if let Some(in_progress) = &slot.in_progress {
@@ -119,7 +129,33 @@ impl StateManager {
         response: Vec<u8>,
     ) -> Result<(), NfsStat4> {
         let mut inner = self.inner.write().await;
+        Self::finish_sequence_locked(&mut inner, token, response)
+    }
 
+    /// Complete a forechannel request without awaiting the state lock.
+    ///
+    /// Returns the token and response body unchanged when the lock is
+    /// contended. This exists for the panic/cancellation cleanup path, which
+    /// runs inside `Drop` and therefore cannot await.
+    pub(crate) fn try_finish_sequence(
+        &self,
+        token: SequenceCacheToken,
+        response: Vec<u8>,
+    ) -> Result<(), (SequenceCacheToken, Vec<u8>)> {
+        match self.inner.try_write() {
+            Ok(mut inner) => {
+                let _ = Self::finish_sequence_locked(&mut inner, token, response);
+                Ok(())
+            }
+            Err(_) => Err((token, response)),
+        }
+    }
+
+    fn finish_sequence_locked(
+        inner: &mut StateInner,
+        token: SequenceCacheToken,
+        response: Vec<u8>,
+    ) -> Result<(), NfsStat4> {
         let session = inner
             .sessions
             .get_mut(&token.sessionid)

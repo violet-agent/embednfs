@@ -9,7 +9,21 @@ pub async fn start_server() -> u16 {
 }
 
 pub async fn start_server_with_fs<F: FileSystem>(fs: F) -> u16 {
-    let server = NfsServer::new(fs);
+    start_server_with(NfsServer::new(fs)).await
+}
+
+/// Starts a server whose connections execute at most `limit` requests
+/// concurrently. `limit == 1` restores fully serialized request handling.
+pub async fn start_server_with_limit<F: FileSystem>(fs: F, limit: usize) -> u16 {
+    start_server_with(
+        NfsServer::builder(fs)
+            .max_concurrent_requests(limit)
+            .build(),
+    )
+    .await
+}
+
+async fn start_server_with<F: FileSystem>(server: NfsServer<F>) -> u16 {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
 

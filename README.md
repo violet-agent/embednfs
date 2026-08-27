@@ -23,6 +23,14 @@ This is a Cargo workspace with three crates:
 - **`embednfs`** — Embeddable server library with the filesystem traits and COMPOUND handler
 - **`embednfsd`** — NFSv4.1 server daemon powered by embednfs
 
+Each connection runs a record reader, a bounded pool of request workers, and a
+dedicated response writer, so COMPOUNDs on different session slots execute
+concurrently over one TCP connection while RPC records stay intact. Per-connection
+concurrency is bounded (default: the advertised forechannel slot count) and
+configurable with `NfsServerBuilder::max_concurrent_requests`. See
+[`docs/concurrency.md`](docs/concurrency.md) for the concurrency and cancellation
+contract.
+
 ## Quick Start
 
 ```rust
